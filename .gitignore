@@ -1,0 +1,15 @@
+# Local Codex metadata
+/.agents/
+/.codex/
+/.moe_offload.git/
+
+# Large local container images
+/docker/*.tar
+
+# Generated experiment outputs
+/results/*
+!/results/.gitkeep
+
+# Python cache files
+__pycache__/
+*.py[cod]

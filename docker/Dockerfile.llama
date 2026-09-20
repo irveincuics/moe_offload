@@ -1,0 +1,37 @@
+ARG BASE_IMAGE=nvidia/cuda:12.9.2-devel-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    ninja-build \
+    ccache \
+    git \
+    curl \
+    wget \
+    pkg-config \
+    libssl-dev \
+    libcurl4-openssl-dev \
+    python3 \
+    python3-pip \
+    python3-venv \
+    numactl \
+    hwloc \
+    pciutils \
+    fio \
+    htop \
+    vim \
+    gdb \
+    && rm -rf /var/lib/apt/lists/*
+
+# llama.cpp + CUDA 12.9 / Blackwell 需要新版 CMake
+RUN python3 -m pip install \
+    --break-system-packages \
+    "cmake>=4.0.2"
+
+WORKDIR /workspace/llama.cpp
+
+CMD ["/bin/bash"]

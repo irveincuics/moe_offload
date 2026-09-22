@@ -62,6 +62,10 @@ test parameters:
   --poll <0...100>                          (default: 50)
   -ngl, --n-gpu-layers <n>                  (default: -1)
   -ncmoe, --n-cpu-moe <n>                   (default: 0)
+  --ssd-moe-offload                          keep Qwen3 MoE experts file-backed
+  --ssd-moe-cache-mib <n>                    bounded expert cache size in MiB (default: 8192)
+  --ssd-moe-cache-workers <n>                SSD expert I/O workers (default: 4)
+  --ssd-moe-stats <0|1>                      print per-eval cache statistics (default: 1)
   -sm, --split-mode <none|layer|row|tensor> (default: layer)
   -mg, --main-gpu <i>                       (default: 0)
   -nkvo, --no-kv-offload <0|1>              (default: 0)

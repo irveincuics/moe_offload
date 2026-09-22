@@ -340,6 +340,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        size_t   ssd_moe_cache_size;    // bounded expert cache size in bytes
+        uint32_t ssd_moe_cache_workers; // number of expert I/O workers
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -347,6 +350,8 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool ssd_moe_offload; // keep supported MoE expert tensors file-backed and load selected experts on demand
+        bool ssd_moe_stats;   // print SSD expert cache statistics after each graph evaluation
     };
 
     struct llama_sampler_seq_config {

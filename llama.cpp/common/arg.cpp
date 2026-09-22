@@ -2716,6 +2716,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
     add_opt(common_arg(
+        {"--ssd-moe-offload"},
+        "keep supported MoE expert tensors file-backed and load selected experts on demand (currently Qwen3 MoE)",
+        [](common_params & params) {
+            params.ssd_moe_offload = true;
+        }
+    ).set_env("LLAMA_ARG_SSD_MOE_OFFLOAD"));
+    add_opt(common_arg(
+        {"--ssd-moe-cache-mib"}, "N",
+        "bounded unified-memory expert cache size in MiB (default: 8192)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("cache size must be positive");
+            }
+            params.ssd_moe_cache_size = (size_t) value * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_SSD_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--ssd-moe-cache-workers"}, "N",
+        "number of SSD expert I/O workers (default: 4)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("worker count must be positive");
+            }
+            params.ssd_moe_cache_workers = value;
+        }
+    ).set_env("LLAMA_ARG_SSD_MOE_CACHE_WORKERS"));
+    add_opt(common_arg(
+        {"--ssd-moe-stats"}, {"--no-ssd-moe-stats"},
+        "print SSD expert cache statistics after each graph evaluation (default: 1)",
+        [](common_params & params, bool value) {
+            params.ssd_moe_stats = value;
+        }
+    ).set_env("LLAMA_ARG_SSD_MOE_STATS"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

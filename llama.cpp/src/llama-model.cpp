@@ -1178,6 +1178,13 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    struct ssd_expert_source {
+        const ggml_tensor * tensor;
+        std::string         path;
+        uint64_t            file_offset;
+    };
+    std::vector<ssd_expert_source> ssd_expert_sources;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1193,6 +1200,22 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
+    }
+}
+
+void llama_model::configure_ssd_cache(ggml_backend_sched_t sched) const {
+    if (!params.ssd_moe_offload) {
+        return;
+    }
+
+    const ggml_backend_sched_ssd_config config = {
+        /*.cache_size =*/ params.ssd_moe_cache_size,
+        /*.n_workers  =*/ params.ssd_moe_cache_workers,
+        /*.stats      =*/ params.ssd_moe_stats,
+    };
+    ggml_backend_sched_configure_ssd_cache(sched, &config);
+    for (const auto & source : pimpl->ssd_expert_sources) {
+        ggml_backend_sched_register_ssd_tensor(sched, source.tensor, source.path.c_str(), source.file_offset);
     }
 }
 
@@ -1411,6 +1434,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
+
+    if (params.ssd_moe_offload && arch != LLM_ARCH_QWEN3MOE) {
+        throw std::runtime_error("SSD MoE offload is currently supported only for Qwen3 MoE models");
+    }
+    if (params.ssd_moe_offload) {
+        LLAMA_LOG_INFO("%s: SSD MoE offload enabled; routed experts will remain file-backed\n", __func__);
+        if (params.check_tensors) {
+            LLAMA_LOG_WARN("%s: tensor validation will read all file-backed experts\n", __func__);
+        }
+    }
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
@@ -1844,6 +1877,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    if (params.ssd_moe_offload) {
+        auto add_ssd_source = [&](const ggml_tensor * tensor) {
+            if (tensor == nullptr) {
+                return;
+            }
+            const auto * weight = ml.get_weight(ggml_get_name(tensor));
+            if (weight == nullptr) {
+                throw std::runtime_error(format("missing SSD source for tensor %s", ggml_get_name(tensor)));
+            }
+            const char * path = ml.files.at(weight->idx)->path();
+            if (path == nullptr || path[0] == '\0') {
+                throw std::runtime_error("SSD MoE offload requires a model loaded from a file path");
+            }
+            pimpl->ssd_expert_sources.push_back({ tensor, path, weight->offs });
+        };
+
+        for (const auto & layer : layers) {
+            add_ssd_source(layer.ffn_gate_exps);
+            add_ssd_source(layer.ffn_up_exps);
+            add_ssd_source(layer.ffn_down_exps);
+        }
+        LLAMA_LOG_INFO("%s: registered %zu routed-expert tensors for the bounded SSD cache\n",
+                __func__, pimpl->ssd_expert_sources.size());
     }
 
     if (use_mmap_buffer) {
@@ -2770,12 +2828,16 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.ssd_moe_cache_size          =*/ 8ull * 1024 * 1024 * 1024,
+        /*.ssd_moe_cache_workers       =*/ 4,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.ssd_moe_offload             =*/ false,
+        /*.ssd_moe_stats               =*/ true,
     };
 
     return result;

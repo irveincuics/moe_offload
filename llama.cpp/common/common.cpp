@@ -1688,7 +1688,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
-    mparams.lazy_mode = params.lazy_mode;
+    mparams.lazy_mode       = params.ssd_moe_offload ? LLAMA_LAZY_MODE_ON : params.lazy_mode;
+    mparams.ssd_moe_offload = params.ssd_moe_offload;
+    mparams.ssd_moe_cache_size    = params.ssd_moe_cache_size;
+    mparams.ssd_moe_cache_workers = params.ssd_moe_cache_workers;
+    mparams.ssd_moe_stats         = params.ssd_moe_stats;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;

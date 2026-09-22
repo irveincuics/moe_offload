@@ -484,6 +484,10 @@ struct common_params {
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
+    size_t   ssd_moe_cache_size    = 8ull * 1024 * 1024 * 1024;
+    uint32_t ssd_moe_cache_workers = 4;
+    bool     ssd_moe_offload       = false; // keep supported MoE expert tensors file-backed
+    bool     ssd_moe_stats         = true;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;

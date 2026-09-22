@@ -352,6 +352,7 @@ struct cmd_params {
     std::vector<int>                 poll;
     std::vector<int>                 n_gpu_layers;
     std::vector<int>                 n_cpu_moe;
+    std::vector<bool>                ssd_moe_offload;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
@@ -375,6 +376,9 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    size_t                           ssd_moe_cache_size = 8ull * 1024 * 1024 * 1024;
+    uint32_t                         ssd_moe_cache_workers = 4;
+    bool                             ssd_moe_stats = true;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -397,6 +401,7 @@ static const cmd_params cmd_params_defaults = {
     /* poll                 */ { 50 },
     /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
+    /* ssd_moe_offload      */ { false },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
@@ -469,6 +474,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
+    printf("  --ssd-moe-offload                                  keep Qwen3 MoE experts file-backed\n");
+    printf("  --ssd-moe-cache-mib <n>                            bounded expert cache size in MiB (default: 8192)\n");
+    printf("  --ssd-moe-cache-workers <n>                        SSD expert I/O workers (default: 4)\n");
+    printf("  --ssd-moe-stats <0|1>                              print per-eval cache statistics (default: 1)\n");
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -728,6 +737,26 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
+            } else if (arg == "--ssd-moe-offload") {
+                params.ssd_moe_offload = { true };
+            } else if (arg == "--ssd-moe-cache-mib") {
+                if (++i >= argc || std::stoi(argv[i]) <= 0) {
+                    invalid_param = true;
+                    break;
+                }
+                params.ssd_moe_cache_size = (size_t) std::stoi(argv[i]) * 1024 * 1024;
+            } else if (arg == "--ssd-moe-cache-workers") {
+                if (++i >= argc || std::stoi(argv[i]) <= 0) {
+                    invalid_param = true;
+                    break;
+                }
+                params.ssd_moe_cache_workers = (uint32_t) std::stoi(argv[i]);
+            } else if (arg == "--ssd-moe-stats") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.ssd_moe_stats = std::stoi(argv[i]) != 0;
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1133,6 +1162,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_cpu_moe.empty()) {
         params.n_cpu_moe = cmd_params_defaults.n_cpu_moe;
     }
+    if (params.ssd_moe_offload.empty()) {
+        params.ssd_moe_offload = cmd_params_defaults.ssd_moe_offload;
+    }
     if (params.split_mode.empty()) {
         params.split_mode = cmd_params_defaults.split_mode;
     }
@@ -1206,6 +1238,7 @@ struct cmd_params_instance {
     int                poll;
     int                n_gpu_layers;
     int                n_cpu_moe;
+    bool               ssd_moe_offload;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
@@ -1220,6 +1253,9 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    size_t             ssd_moe_cache_size = 8ull * 1024 * 1024 * 1024;
+    uint32_t           ssd_moe_cache_workers = 4;
+    bool               ssd_moe_stats = true;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1229,8 +1265,12 @@ struct cmd_params_instance {
             mparams.devices = const_cast<ggml_backend_dev_t *>(devices.data());
         }
         mparams.split_mode    = split_mode;
-        mparams.load_mode     = load_mode;
-        mparams.lazy_mode     = lazy_mode;
+        mparams.load_mode       = load_mode;
+        mparams.lazy_mode       = ssd_moe_offload ? LLAMA_LAZY_MODE_ON : lazy_mode;
+        mparams.ssd_moe_offload = ssd_moe_offload;
+        mparams.ssd_moe_cache_size    = ssd_moe_cache_size;
+        mparams.ssd_moe_cache_workers = ssd_moe_cache_workers;
+        mparams.ssd_moe_stats         = ssd_moe_stats;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
@@ -1276,6 +1316,10 @@ struct cmd_params_instance {
 
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+               ssd_moe_offload == other.ssd_moe_offload &&
+               ssd_moe_cache_size == other.ssd_moe_cache_size &&
+               ssd_moe_cache_workers == other.ssd_moe_cache_workers &&
+               ssd_moe_stats == other.ssd_moe_stats &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
@@ -1311,6 +1355,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & fpc : params.fit_params_min_ctx)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
+    for (const auto & ssdoff : params.ssd_moe_offload)
     for (const auto & sm : params.split_mode)
     for (const auto & lm : params.load_mode)
     for (const auto & lzm : params.lazy_mode)
@@ -1351,6 +1396,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .ssd_moe_offload       = */ ssdoff,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1366,6 +1412,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
+            instance.ssd_moe_cache_size    = params.ssd_moe_cache_size;
+            instance.ssd_moe_cache_workers = params.ssd_moe_cache_workers;
+            instance.ssd_moe_stats         = params.ssd_moe_stats;
             instances.push_back(instance);
         }
 
@@ -1388,6 +1437,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .ssd_moe_offload       = */ ssdoff,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1403,6 +1453,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
+            instance.ssd_moe_cache_size    = params.ssd_moe_cache_size;
+            instance.ssd_moe_cache_workers = params.ssd_moe_cache_workers;
+            instance.ssd_moe_stats         = params.ssd_moe_stats;
             instances.push_back(instance);
         }
 
@@ -1425,6 +1478,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
+                /* .ssd_moe_offload       = */ ssdoff,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1440,6 +1494,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
+            instance.ssd_moe_cache_size    = params.ssd_moe_cache_size;
+            instance.ssd_moe_cache_workers = params.ssd_moe_cache_workers;
+            instance.ssd_moe_stats         = params.ssd_moe_stats;
             instances.push_back(instance);
         }
     }
@@ -1467,6 +1524,9 @@ struct test {
     ggml_type                type_v;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
+    bool                     ssd_moe_offload;
+    size_t                   ssd_moe_cache_size;
+    uint32_t                 ssd_moe_cache_workers;
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
     llama_lazy_mode          lazy_mode;
@@ -1505,11 +1565,14 @@ struct test {
         poll           = inst.poll;
         type_k         = inst.type_k;
         type_v         = inst.type_v;
-        n_gpu_layers   = inst.n_gpu_layers;
-        n_cpu_moe      = inst.n_cpu_moe;
-        split_mode     = inst.split_mode;
-        load_mode      = inst.load_mode;
-        lazy_mode      = inst.lazy_mode;
+        n_gpu_layers    = inst.n_gpu_layers;
+        n_cpu_moe       = inst.n_cpu_moe;
+        ssd_moe_offload = inst.ssd_moe_offload;
+        ssd_moe_cache_size    = inst.ssd_moe_cache_size;
+        ssd_moe_cache_workers = inst.ssd_moe_cache_workers;
+        split_mode      = inst.split_mode;
+        load_mode       = inst.load_mode;
+        lazy_mode       = inst.ssd_moe_offload ? LLAMA_LAZY_MODE_ON : inst.lazy_mode;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
@@ -1575,7 +1638,9 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "ssd_moe_offload",
+            "ssd_moe_cache_size",               "ssd_moe_cache_workers",
+            "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
@@ -1593,10 +1658,12 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "ssd_moe_cache_size" || field == "ssd_moe_cache_workers") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
+            field == "ssd_moe_offload" ||
             field == "embeddings" || field == "no_host") {
             return BOOL;
         }
@@ -1665,6 +1732,9 @@ struct test {
                                             ggml_type_name(type_v),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
+                                            std::to_string(ssd_moe_offload),
+                                            std::to_string(ssd_moe_cache_size),
+                                            std::to_string(ssd_moe_cache_workers),
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
@@ -1939,6 +2009,11 @@ struct markdown_printer : public printer {
         }
         if (params.n_cpu_moe.size() > 1 || params.n_cpu_moe != cmd_params_defaults.n_cpu_moe) {
             fields.emplace_back("n_cpu_moe");
+        }
+        if (params.ssd_moe_offload.size() > 1 || params.ssd_moe_offload != cmd_params_defaults.ssd_moe_offload) {
+            fields.emplace_back("ssd_moe_offload");
+            fields.emplace_back("ssd_moe_cache_size");
+            fields.emplace_back("ssd_moe_cache_workers");
         }
         if (params.n_threads.size() > 1 || params.n_threads != cmd_params_defaults.n_threads || is_cpu_backend) {
             fields.emplace_back("n_threads");

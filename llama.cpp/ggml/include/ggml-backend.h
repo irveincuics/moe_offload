@@ -306,6 +306,12 @@ extern "C" {
 
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+    struct ggml_backend_sched_ssd_config {
+        size_t   cache_size;
+        uint32_t n_workers;
+        bool     stats;
+    };
+
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call
@@ -318,6 +324,8 @@ extern "C" {
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+    GGML_API void                 ggml_backend_sched_configure_ssd_cache(ggml_backend_sched_t sched, const struct ggml_backend_sched_ssd_config * config);
+    GGML_API void                 ggml_backend_sched_register_ssd_tensor(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const char * path, uint64_t file_offset);
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);

@@ -14,14 +14,33 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
+#if defined(__linux__)
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -772,6 +791,368 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+class ggml_ssd_worker_pool {
+public:
+    explicit ggml_ssd_worker_pool(uint32_t n_workers) {
+        n_workers = std::max<uint32_t>(1, n_workers);
+        workers.reserve(n_workers);
+        for (uint32_t i = 0; i < n_workers; ++i) {
+            workers.emplace_back([this] {
+                for (;;) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        condition.wait(lock, [this] { return stopping || !tasks.empty(); });
+                        if (stopping && tasks.empty()) {
+                            return;
+                        }
+                        task = std::move(tasks.front());
+                        tasks.pop_front();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    ~ggml_ssd_worker_pool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        condition.notify_all();
+        for (auto & worker : workers) {
+            worker.join();
+        }
+    }
+
+    std::shared_future<bool> submit(std::function<bool()> fn) {
+        auto task = std::make_shared<std::packaged_task<bool()>>(std::move(fn));
+        std::shared_future<bool> result = task->get_future().share();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            tasks.emplace_back([task] { (*task)(); });
+        }
+        condition.notify_one();
+        return result;
+    }
+
+private:
+    std::vector<std::thread>       workers;
+    std::deque<std::function<void()>> tasks;
+    std::mutex                     mutex;
+    std::condition_variable        condition;
+    bool                           stopping = false;
+};
+
+struct ggml_ssd_source_file {
+    explicit ggml_ssd_source_file(const std::string & path) : path(path) {
+#if defined(__linux__)
+        fd_buffered = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        fd_direct   = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+        if (fd_direct >= 0) {
+            struct stat st = {};
+            if (fstat(fd_direct, &st) == 0 && st.st_blksize > 0) {
+                alignment = std::max<size_t>(4096, st.st_blksize);
+            }
+        }
+#endif
+    }
+
+    ~ggml_ssd_source_file() {
+#if defined(__linux__)
+        if (fd_direct >= 0) {
+            close(fd_direct);
+        }
+        if (fd_buffered >= 0) {
+            close(fd_buffered);
+        }
+#endif
+    }
+
+    bool read(uint64_t offset, void * dst, size_t size, uint64_t & physical_bytes, bool & direct) const {
+#if defined(__linux__)
+        if (fd_direct >= 0) {
+            const uint64_t aligned_offset = offset - offset % alignment;
+            const size_t prefix = offset - aligned_offset;
+            const size_t aligned_size = ((prefix + size + alignment - 1) / alignment) * alignment;
+            void * raw = nullptr;
+            if (posix_memalign(&raw, alignment, aligned_size) == 0) {
+                const bool ok = read_exact(fd_direct, raw, aligned_size, aligned_offset);
+                if (ok) {
+                    memcpy(dst, (const uint8_t *) raw + prefix, size);
+                    free(raw);
+                    physical_bytes = aligned_size;
+                    direct = true;
+                    return true;
+                }
+                free(raw);
+            }
+        }
+
+        if (fd_buffered >= 0 && read_exact(fd_buffered, dst, size, offset)) {
+            physical_bytes = size;
+            direct = false;
+            return true;
+        }
+#else
+        GGML_UNUSED(offset);
+        GGML_UNUSED(dst);
+        GGML_UNUSED(size);
+        GGML_UNUSED(physical_bytes);
+        GGML_UNUSED(direct);
+#endif
+        return false;
+    }
+
+    bool uses_direct_io() const {
+#if defined(__linux__)
+        return fd_direct >= 0;
+#else
+        return false;
+#endif
+    }
+
+    std::string path;
+    size_t alignment = 4096;
+
+private:
+#if defined(__linux__)
+    static bool read_exact(int fd, void * dst, size_t size, uint64_t offset) {
+        size_t done = 0;
+        while (done < size) {
+            const ssize_t n = pread(fd, (uint8_t *) dst + done, size - done, (off_t) (offset + done));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return false;
+            }
+            if (n == 0) {
+                memset((uint8_t *) dst + done, 0, size - done);
+                break;
+            }
+            done += n;
+        }
+        return true;
+    }
+
+    int fd_direct   = -1;
+    int fd_buffered = -1;
+#endif
+};
+
+class ggml_ssd_expert_cache {
+public:
+    struct entry {
+        std::vector<uint8_t>     data;
+        std::shared_future<bool> ready;
+        uint64_t                 last_use = 0;
+    };
+
+    ggml_ssd_expert_cache(size_t capacity, uint32_t n_workers, bool stats) :
+        capacity(capacity), stats_enabled(stats), workers(n_workers) {
+        GGML_LOG_INFO("ssd_moe_cache: capacity = %.2f MiB, workers = %u\n", capacity/1024.0/1024.0, n_workers);
+    }
+
+    ~ggml_ssd_expert_cache() {
+        if (stats_enabled) {
+            report(true);
+        }
+    }
+
+    void register_tensor(const ggml_tensor * tensor, const char * path, uint64_t file_offset) {
+        std::shared_ptr<ggml_ssd_source_file> file;
+        auto file_it = files.find(path);
+        if (file_it == files.end()) {
+            file = std::make_shared<ggml_ssd_source_file>(path);
+            files.emplace(path, file);
+            GGML_LOG_INFO("ssd_moe_cache: source %s (%s)\n", path, file->uses_direct_io() ? "O_DIRECT" : "buffered pread");
+        } else {
+            file = file_it->second;
+        }
+        const source value = { std::move(file), file_offset, tensor };
+        sources[tensor] = value;
+        sources_by_name[ggml_get_name(tensor)] = value;
+    }
+
+    std::vector<std::shared_ptr<entry>> acquire(
+            const ggml_tensor * tensor,
+            const std::vector<int32_t> & expert_ids,
+            int64_t n_expert,
+            size_t expert_size,
+            ggml_backend_t backend) {
+        source tensor_source;
+        const auto source_it = sources.find(tensor);
+        if (source_it != sources.end()) {
+            tensor_source = source_it->second;
+        } else {
+            const auto name_it = sources_by_name.find(ggml_get_name(tensor));
+            if (name_it == sources_by_name.end()) {
+                return {};
+            }
+            tensor_source = name_it->second;
+        }
+        if (expert_ids.empty()) {
+            return {};
+        }
+
+        const size_t padding = std::min<size_t>(expert_size, 512);
+        const ggml_tensor * cache_tensor = tensor_source.tensor;
+        size_t missing_bytes = 0;
+        std::unordered_set<key, key_hash> requested;
+        requested.reserve(expert_ids.size());
+        for (int32_t id : expert_ids) {
+            const key k = { cache_tensor, id };
+            requested.insert(k);
+            if (entries.find(k) == entries.end()) {
+                missing_bytes += expert_size + (id < n_expert - 1 ? padding : 0);
+            }
+        }
+
+        if (missing_bytes > capacity) {
+            GGML_LOG_WARN("ssd_moe_cache: selected experts need %.2f MiB but cache capacity is %.2f MiB; using mmap fallback\n",
+                    missing_bytes/1024.0/1024.0, capacity/1024.0/1024.0);
+            return {};
+        }
+
+        if (resident_bytes + missing_bytes > capacity) {
+            ggml_backend_synchronize(backend);
+            while (resident_bytes + missing_bytes > capacity) {
+                auto victim = entries.end();
+                for (auto it = entries.begin(); it != entries.end(); ++it) {
+                    if (requested.count(it->first) != 0 || it->second->ready.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                        continue;
+                    }
+                    if (victim == entries.end() || it->second->last_use < victim->second->last_use) {
+                        victim = it;
+                    }
+                }
+                if (victim == entries.end()) {
+                    return {};
+                }
+                resident_bytes -= victim->second->data.size();
+                entries.erase(victim);
+                n_evictions++;
+            }
+        }
+
+        std::vector<std::shared_ptr<entry>> result;
+        result.reserve(expert_ids.size());
+        const auto source = tensor_source;
+        for (int32_t id : expert_ids) {
+            const key k = { cache_tensor, id };
+            auto it = entries.find(k);
+            if (it != entries.end()) {
+                n_hits++;
+                it->second->last_use = ++clock;
+                result.push_back(it->second);
+                continue;
+            }
+
+            n_misses++;
+            const size_t read_size = expert_size + (id < n_expert - 1 ? padding : 0);
+            auto item = std::make_shared<entry>();
+            item->data.resize(read_size);
+            item->last_use = ++clock;
+            resident_bytes += read_size;
+            const uint8_t * fallback = (const uint8_t *) cache_tensor->data + (size_t) id * expert_size;
+            item->ready = workers.submit([this, item, source, fallback, id, expert_size, read_size] {
+                const auto begin = std::chrono::steady_clock::now();
+                uint64_t physical_bytes = 0;
+                bool direct = false;
+                const bool ok = source.file->read(source.file_offset + (uint64_t) id * expert_size,
+                        item->data.data(), read_size, physical_bytes, direct);
+                if (!ok) {
+                    memcpy(item->data.data(), fallback, read_size);
+                    n_read_fallbacks++;
+                } else {
+                    n_disk_bytes += physical_bytes;
+                    if (direct) {
+                        n_direct_reads++;
+                    }
+                }
+                n_logical_bytes += read_size;
+                n_io_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+                return true;
+            });
+            entries.emplace(k, item);
+            result.push_back(std::move(item));
+        }
+
+        for (const auto & item : result) {
+            if (!item->ready.get()) {
+                return {};
+            }
+        }
+        return result;
+    }
+
+    void add_backend_copy(size_t bytes) {
+        n_backend_bytes += bytes;
+    }
+
+    void report(bool final = false) {
+        if (!stats_enabled) {
+            return;
+        }
+        const uint64_t hits = n_hits.load();
+        const uint64_t misses = n_misses.load();
+        const uint64_t accesses = hits + misses;
+        const double hit_rate = accesses ? 100.0 * hits / accesses : 0.0;
+        GGML_LOG_INFO("ssd_moe_cache: %s=%" PRIu64 " hit_rate=%.2f%% hits=%" PRIu64 " misses=%" PRIu64
+                " resident=%.2f MiB disk=%.2f MiB logical=%.2f MiB backend_copy=%.2f MiB io=%.3f ms evictions=%" PRIu64
+                " direct_reads=%" PRIu64 " fallbacks=%" PRIu64 "\n",
+                final ? "final_evals" : "eval", final ? n_evals.load() : ++n_evals,
+                hit_rate, hits, misses, resident_bytes/1024.0/1024.0,
+                n_disk_bytes.load()/1024.0/1024.0, n_logical_bytes.load()/1024.0/1024.0,
+                n_backend_bytes.load()/1024.0/1024.0, n_io_us.load()/1000.0, n_evictions.load(),
+                n_direct_reads.load(), n_read_fallbacks.load());
+    }
+
+private:
+    struct source {
+        std::shared_ptr<ggml_ssd_source_file> file;
+        uint64_t                              file_offset;
+        const ggml_tensor *                   tensor;
+    };
+
+    struct key {
+        const ggml_tensor * tensor;
+        int32_t             expert;
+
+        bool operator==(const key & other) const {
+            return tensor == other.tensor && expert == other.expert;
+        }
+    };
+
+    struct key_hash {
+        size_t operator()(const key & value) const {
+            return std::hash<const void *>()(value.tensor) ^ (std::hash<int32_t>()(value.expert) << 1);
+        }
+    };
+
+    size_t capacity;
+    size_t resident_bytes = 0;
+    bool stats_enabled;
+    uint64_t clock = 0;
+    std::unordered_map<std::string, std::shared_ptr<ggml_ssd_source_file>> files;
+    std::unordered_map<const ggml_tensor *, source> sources;
+    std::unordered_map<std::string, source> sources_by_name;
+    std::unordered_map<key, std::shared_ptr<entry>, key_hash> entries;
+    std::atomic<uint64_t> n_hits{0};
+    std::atomic<uint64_t> n_misses{0};
+    std::atomic<uint64_t> n_evictions{0};
+    std::atomic<uint64_t> n_disk_bytes{0};
+    std::atomic<uint64_t> n_logical_bytes{0};
+    std::atomic<uint64_t> n_backend_bytes{0};
+    std::atomic<uint64_t> n_io_us{0};
+    std::atomic<uint64_t> n_direct_reads{0};
+    std::atomic<uint64_t> n_read_fallbacks{0};
+    std::atomic<uint64_t> n_evals{0};
+    ggml_ssd_worker_pool workers;
+};
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -838,6 +1219,8 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    ggml_ssd_expert_cache * ssd_cache;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1734,6 +2117,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    std::vector<int32_t> selected_ids;
+                    selected_ids.reserve(n_expert);
+                    for (int32_t id = 0; id < n_expert; ++id) {
+                        if (ggml_bitset_get(used_ids.data(), id)) {
+                            selected_ids.push_back(id);
+                        }
+                    }
+
+                    if (sched->ssd_cache != nullptr) {
+                        auto cached = sched->ssd_cache->acquire(input, selected_ids, n_expert, expert_size, split_backend);
+                        if (cached.size() == selected_ids.size()) {
+                            for (size_t i = 0; i < selected_ids.size(); ++i) {
+                                const size_t expert_offset = (size_t) selected_ids[i] * expert_size;
+                                ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                        cached[i]->data.data(), expert_offset, cached[i]->data.size());
+                                sched->ssd_cache->add_backend_copy(cached[i]->data.size());
+                            }
+                            continue;
+                        }
+                    }
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
@@ -1747,6 +2151,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                        if (sched->ssd_cache != nullptr) {
+                            sched->ssd_cache->add_backend_copy(expert_size_copy + padding_end);
+                        }
                     };
 
                     int id = 0;
@@ -1910,10 +2317,39 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+void ggml_backend_sched_configure_ssd_cache(
+        ggml_backend_sched_t sched,
+        const struct ggml_backend_sched_ssd_config * config) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(config);
+    GGML_ASSERT(config->cache_size > 0);
+    GGML_ASSERT(config->n_workers > 0);
+    delete sched->ssd_cache;
+    sched->ssd_cache = new ggml_ssd_expert_cache(config->cache_size, config->n_workers, config->stats);
+}
+
+void ggml_backend_sched_register_ssd_tensor(
+        ggml_backend_sched_t sched,
+        const struct ggml_tensor * tensor,
+        const char * path,
+        uint64_t file_offset) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(sched->ssd_cache);
+    GGML_ASSERT(tensor);
+    GGML_ASSERT(path);
+    sched->ssd_cache->register_tensor(tensor, path, file_offset);
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    if (sched->ssd_cache != nullptr) {
+        for (int b = 0; b < sched->n_backends; ++b) {
+            ggml_backend_synchronize(sched->backends[b]);
+        }
+    }
+    delete sched->ssd_cache;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2019,7 +2455,11 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    const enum ggml_status result = ggml_backend_sched_compute_splits(sched);
+    if (sched->ssd_cache != nullptr) {
+        sched->ssd_cache->report(false);
+    }
+    return result;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

@@ -702,6 +702,22 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    ggml_cuda_set_device(device);
+    for (auto & item : moe_expert_ptrs) {
+        if (item.second->pending) {
+            CUDA_CHECK(cudaEventSynchronize(item.second->copy_done));
+        }
+        if (item.second->copy_done) {
+            CUDA_CHECK(cudaEventDestroy(item.second->copy_done));
+        }
+        if (item.second->device) {
+            CUDA_CHECK(cudaFree(item.second->device));
+        }
+        if (item.second->host) {
+            CUDA_CHECK(cudaFreeHost(item.second->host));
+        }
+    }
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -1935,7 +1951,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+            const auto pointers = ctx.moe_expert_ptrs.find(src0);
+            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst,
+                    !getenv("GGML_MOE_ZERO_COPY") || atoi(getenv("GGML_MOE_ZERO_COPY")) != 1 || pointers == ctx.moe_expert_ptrs.end() ?
+                    nullptr : (const void * const *) pointers->second->device);
             return;
         }
     }
@@ -2434,12 +2453,42 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+struct ggml_cuda_m0_span {
+    bool enabled;
+    const char * name;
+    size_t offset, bytes;
+    cudaStream_t stream;
+    cudaEvent_t begin, end;
+
+    ggml_cuda_m0_span(bool enabled, const char * name, cudaStream_t stream, size_t offset = 0, size_t bytes = 0) :
+        enabled(enabled), name(name), offset(offset), bytes(bytes), stream(stream) {
+        if (!enabled) { return; }
+        CUDA_CHECK(cudaEventCreate(&begin));
+        CUDA_CHECK(cudaEventCreate(&end));
+        ggml_backend_moe_trace_cuda_event(bytes ? "cuda_copy_begin" : "cuda_consumer_begin", name, offset, bytes, -1);
+        CUDA_CHECK(cudaEventRecord(begin, stream));
+    }
+
+    ~ggml_cuda_m0_span() {
+        if (!enabled) { return; }
+        CUDA_CHECK(cudaEventRecord(end, stream));
+        CUDA_CHECK(cudaEventSynchronize(end));
+        float elapsed = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed, begin, end));
+        ggml_backend_moe_trace_cuda_event(bytes ? "cuda_copy_end" : "cuda_consumer_end", name, offset, bytes, elapsed);
+        CUDA_CHECK(cudaEventDestroy(begin));
+        CUDA_CHECK(cudaEventDestroy(end));
+    }
+};
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_m0_span span(ggml_backend_moe_trace_active(), tensor->name, cuda_ctx->stream(), offset, size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -4414,6 +4463,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    const bool trace_moe = ggml_backend_moe_trace_active() && cgraph->n_nodes == 1 && cgraph->nodes[0]->op == GGML_OP_MUL_MAT_ID;
+    ggml_cuda_m0_span span(trace_moe, trace_moe ? cgraph->nodes[0]->src[0]->name : "", cuda_ctx->stream());
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -5667,6 +5719,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static bool ggml_backend_cuda_moe_set_expert_ptrs(
+        ggml_backend_t backend, const ggml_tensor * op, const ggml_tensor * weights,
+        const void * const * pointers, size_t count) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(backend);
+    GGML_UNUSED(op);
+    GGML_UNUSED(weights);
+    GGML_UNUSED(pointers);
+    GGML_UNUSED(count);
+    return false;
+#else
+    if (!backend || !op || !weights || !pointers || op->op != GGML_OP_MUL_MAT_ID ||
+            op->src[0] != weights || count != (size_t) weights->ne[2]) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    int pageable = 0;
+    int host_tables = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, ctx->device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&host_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, ctx->device));
+    if (!pageable || !host_tables || !ggml_cuda_should_use_mmf(
+            weights->type, ggml_cuda_info().devices[ctx->device].cc, WARP_SIZE,
+            weights->ne, weights->nb, op->src[1]->ne[2], true)) {
+        return false;
+    }
+
+    auto & state = ctx->moe_expert_ptrs[weights];
+    if (!state) {
+        state = std::make_unique<ggml_cuda_moe_expert_ptrs>();
+    }
+    if (state->pending) {
+        CUDA_CHECK(cudaEventSynchronize(state->copy_done));
+        state->pending = false;
+    }
+    if (state->capacity < count) {
+        if (state->copy_done) {
+            CUDA_CHECK(cudaEventDestroy(state->copy_done));
+            state->copy_done = nullptr;
+        }
+        if (state->device) {
+            CUDA_CHECK(cudaFree(state->device));
+        }
+        if (state->host) {
+            CUDA_CHECK(cudaFreeHost(state->host));
+        }
+        CUDA_CHECK(cudaMallocHost(&state->host, count * sizeof(void *)));
+        CUDA_CHECK(cudaMalloc(&state->device, count * sizeof(void *)));
+        CUDA_CHECK(cudaEventCreateWithFlags(&state->copy_done, cudaEventDisableTiming));
+        state->capacity = count;
+    }
+    memcpy(state->host, pointers, count * sizeof(void *));
+    CUDA_CHECK(cudaMemcpyAsync(state->device, state->host, count * sizeof(void *), cudaMemcpyHostToDevice, ctx->stream()));
+    CUDA_CHECK(cudaEventRecord(state->copy_done, ctx->stream()));
+    state->pending = true;
+    return true;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5686,6 +5797,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_moe_set_expert_ptrs") == 0) {
+        return (void *)ggml_backend_cuda_moe_set_expert_ptrs;
     }
     return nullptr;
 }

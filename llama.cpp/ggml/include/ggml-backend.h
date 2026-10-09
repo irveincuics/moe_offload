@@ -326,6 +326,15 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
     GGML_API void                 ggml_backend_sched_configure_ssd_cache(ggml_backend_sched_t sched, const struct ggml_backend_sched_ssd_config * config);
     GGML_API void                 ggml_backend_sched_register_ssd_tensor(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const char * path, uint64_t file_offset);
+    // Packed records share one allocation and read across gate/up/down tensors.
+    GGML_API void                 ggml_backend_sched_register_ssd_packed_tensor(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const char * path, uint64_t file_offset, size_t record_size, size_t slice_offset, const struct ggml_tensor * group);
+
+    // M0 diagnostics: one request/context per process. This mode synchronizes graph nodes.
+    GGML_API bool ggml_backend_moe_trace_open(const char * path, const char * request);
+    GGML_API void ggml_backend_moe_trace_step(int64_t eval, int64_t token, int64_t n_tokens);
+    GGML_API void ggml_backend_moe_trace_close(void);
+    GGML_API bool ggml_backend_moe_trace_active(void);
+    GGML_API void ggml_backend_moe_trace_cuda_event(const char * event, const char * tensor, size_t offset, size_t bytes, double elapsed_ms);
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);

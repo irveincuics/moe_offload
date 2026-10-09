@@ -1446,6 +1446,14 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_moe_expert_ptrs {
+    void ** host = nullptr;
+    void ** device = nullptr;
+    cudaEvent_t copy_done = nullptr;
+    size_t capacity = 0;
+    bool pending = false;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1457,6 +1465,8 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+
+    std::unordered_map<const ggml_tensor *, std::unique_ptr<ggml_cuda_moe_expert_ptrs>> moe_expert_ptrs;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

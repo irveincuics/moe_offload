@@ -39,6 +39,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#if defined(__linux__)
+#include <sys/stat.h>
+#endif
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1183,6 +1186,9 @@ struct llama_model::impl {
         const ggml_tensor * tensor;
         std::string         path;
         uint64_t            file_offset;
+        size_t              record_size = 0;
+        size_t              slice_offset = 0;
+        const ggml_tensor * group = nullptr;
     };
     std::vector<ssd_expert_source> ssd_expert_sources;
 };
@@ -1207,6 +1213,10 @@ void llama_model::configure_ssd_cache(ggml_backend_sched_t sched) const {
     if (!params.ssd_moe_offload) {
         return;
     }
+    // M0 mmap control: keep the same lazy tensors without the explicit SSD cache.
+    if (getenv("GGML_MOE_MMAP_ONLY") && atoi(getenv("GGML_MOE_MMAP_ONLY")) == 1) {
+        return;
+    }
 
     const ggml_backend_sched_ssd_config config = {
         /*.cache_size =*/ params.ssd_moe_cache_size,
@@ -1215,7 +1225,12 @@ void llama_model::configure_ssd_cache(ggml_backend_sched_t sched) const {
     };
     ggml_backend_sched_configure_ssd_cache(sched, &config);
     for (const auto & source : pimpl->ssd_expert_sources) {
-        ggml_backend_sched_register_ssd_tensor(sched, source.tensor, source.path.c_str(), source.file_offset);
+        if (source.record_size) {
+            ggml_backend_sched_register_ssd_packed_tensor(sched, source.tensor, source.path.c_str(),
+                    source.file_offset, source.record_size, source.slice_offset, source.group);
+        } else {
+            ggml_backend_sched_register_ssd_tensor(sched, source.tensor, source.path.c_str(), source.file_offset);
+        }
     }
 }
 
@@ -1899,6 +1914,89 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             add_ssd_source(layer.ffn_gate_exps);
             add_ssd_source(layer.ffn_up_exps);
             add_ssd_source(layer.ffn_down_exps);
+        }
+        const char * pack_path = getenv("LLAMA_SSD_MOE_PACK");
+        if (pack_path && pack_path[0]) {
+#if defined(__linux__)
+            if (getenv("GGML_MOE_MMAP_ONLY") && atoi(getenv("GGML_MOE_MMAP_ONLY")) == 1) {
+                throw std::runtime_error("LLAMA_SSD_MOE_PACK cannot be used with GGML_MOE_MMAP_ONLY");
+            }
+            const auto & original = pimpl->ssd_expert_sources;
+            if (original.empty() || original.size() != layers.size() * 3) {
+                throw std::runtime_error("SSD pack requires three expert tensors per layer");
+            }
+            struct stat model_stat = {}, pack_stat = {};
+            if (stat(original[0].path.c_str(), &model_stat) || stat(pack_path, &pack_stat) ||
+                    !S_ISREG(pack_stat.st_mode)) {
+                throw std::runtime_error("cannot stat SSD pack/source");
+            }
+            gguf_init_params pack_params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            std::unique_ptr<gguf_context, decltype(&gguf_free)> pack(gguf_init_from_file(pack_path, pack_params), gguf_free);
+            if (!pack) { throw std::runtime_error("cannot read SSD pack metadata"); }
+            auto value = [&](const std::string & key) -> uint64_t {
+                const int64_t id = gguf_find_key(pack.get(), key.c_str());
+                if (id < 0 || gguf_get_kv_type(pack.get(), id) != GGUF_TYPE_UINT64) {
+                    throw std::runtime_error("invalid SSD pack key: " + key);
+                }
+                return gguf_get_val_u64(pack.get(), id);
+            };
+            const uint64_t mtime_ns = uint64_t(model_stat.st_mtim.tv_sec) * 1000000000 + model_stat.st_mtim.tv_nsec;
+            if (value("ssd_pack.version") != 1 || value("ssd_pack.source_size") != uint64_t(model_stat.st_size) ||
+                    value("ssd_pack.source_mtime_ns") != mtime_ns || gguf_get_alignment(pack.get()) != 4096) {
+                throw std::runtime_error("SSD pack is stale or has an unsupported layout; repack the source GGUF");
+            }
+            std::vector<impl::ssd_expert_source> packed_sources;
+            size_t records = 0;
+            uint64_t expected_offset = gguf_get_data_offset(pack.get());
+            for (size_t layer = 0; layer < layers.size(); ++layer) {
+                const ggml_tensor * group = original[3 * layer].tensor;
+                size_t record_size = 0;
+                size_t offsets[3] = {};
+                for (size_t part = 0; part < 3; ++part) {
+                    const auto & src = original[3 * layer + part];
+                    const ggml_tensor * tensor = src.tensor;
+                    const std::string prefix = std::string("ssd_pack.") + tensor->name + ".";
+                    if (src.path != original[0].path || !ggml_is_contiguous(tensor) || tensor->ne[3] != 1 ||
+                            tensor->ne[2] != group->ne[2] || value(prefix + "type") != uint64_t(tensor->type) ||
+                            value(prefix + "source_offset") != src.file_offset) {
+                        throw std::runtime_error("SSD pack source mismatch: " + std::string(tensor->name));
+                    }
+                    for (int dim = 0; dim < 3; ++dim) {
+                        if (value(prefix + "ne" + std::to_string(dim)) != uint64_t(tensor->ne[dim])) {
+                            throw std::runtime_error("SSD pack shape mismatch: " + std::string(tensor->name));
+                        }
+                    }
+                    offsets[part] = record_size;
+                    record_size += tensor->nb[2] + std::min<size_t>(tensor->nb[2], 512);
+                }
+                record_size = GGML_PAD(record_size, 4096);
+                const uint64_t layer_offset = expected_offset;
+                for (int64_t expert = 0; expert < group->ne[2]; ++expert) {
+                    const std::string name = "blk." + std::to_string(layer) + ".expert." + std::to_string(expert);
+                    const int64_t id = gguf_find_tensor(pack.get(), name.c_str());
+                    if (id < 0 || gguf_get_tensor_type(pack.get(), id) != GGML_TYPE_I8 ||
+                            gguf_get_tensor_ne(pack.get(), id)[0] != int64_t(record_size) ||
+                            gguf_get_tensor_size(pack.get(), id) != record_size ||
+                            gguf_get_data_offset(pack.get()) + gguf_get_tensor_offset(pack.get(), id) != expected_offset ||
+                            expected_offset > uint64_t(pack_stat.st_size) || record_size > uint64_t(pack_stat.st_size) - expected_offset) {
+                        throw std::runtime_error("invalid or truncated SSD pack record: " + name);
+                    }
+                    expected_offset += record_size;
+                    ++records;
+                }
+                for (size_t part = 0; part < 3; ++part) {
+                    packed_sources.push_back({original[3 * layer + part].tensor, pack_path,
+                            layer_offset, record_size, offsets[part], group});
+                }
+            }
+            if (records != size_t(gguf_get_n_tensors(pack.get())) || expected_offset != uint64_t(pack_stat.st_size)) {
+                throw std::runtime_error("SSD pack record count/length mismatch");
+            }
+            pimpl->ssd_expert_sources = std::move(packed_sources);
+            LLAMA_LOG_INFO("%s: using SSD expert pack %s (%zu aligned records)\n", __func__, pack_path, records);
+#else
+            throw std::runtime_error("SSD expert packs currently require Linux");
+#endif
         }
         LLAMA_LOG_INFO("%s: registered %zu routed-expert tensors for the bounded SSD cache\n",
                 __func__, pimpl->ssd_expert_sources.size());

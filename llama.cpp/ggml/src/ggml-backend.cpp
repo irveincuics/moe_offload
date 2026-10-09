@@ -35,6 +35,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "ggml-moe-trace.h"
+
 #if defined(__linux__)
 #include <errno.h>
 #include <fcntl.h>
@@ -870,9 +872,15 @@ struct ggml_ssd_source_file {
 #endif
     }
 
-    bool read(uint64_t offset, void * dst, size_t size, uint64_t & physical_bytes, bool & direct) const {
+    bool read(uint64_t offset, void * dst, size_t size, uint64_t & physical_bytes, bool & direct, uint64_t & bounce_bytes) const {
 #if defined(__linux__)
         if (fd_direct >= 0) {
+            if (offset % alignment == 0 && size % alignment == 0 && (uintptr_t) dst % alignment == 0 &&
+                    read_exact(fd_direct, dst, size, offset)) {
+                physical_bytes = size;
+                direct = true;
+                return true;
+            }
             const uint64_t aligned_offset = offset - offset % alignment;
             const size_t prefix = offset - aligned_offset;
             const size_t aligned_size = ((prefix + size + alignment - 1) / alignment) * alignment;
@@ -883,6 +891,7 @@ struct ggml_ssd_source_file {
                     memcpy(dst, (const uint8_t *) raw + prefix, size);
                     free(raw);
                     physical_bytes = aligned_size;
+                    bounce_bytes = size;
                     direct = true;
                     return true;
                 }
@@ -901,6 +910,7 @@ struct ggml_ssd_source_file {
         GGML_UNUSED(size);
         GGML_UNUSED(physical_bytes);
         GGML_UNUSED(direct);
+        GGML_UNUSED(bounce_bytes);
 #endif
         return false;
     }
@@ -929,8 +939,7 @@ private:
                 return false;
             }
             if (n == 0) {
-                memset((uint8_t *) dst + done, 0, size - done);
-                break;
+                return false;
             }
             done += n;
         }
@@ -944,24 +953,60 @@ private:
 
 class ggml_ssd_expert_cache {
 public:
+    struct aligned_buffer {
+        std::unique_ptr<uint8_t[]> allocation;
+        uint8_t * base = nullptr;
+        size_t length = 0;
+        size_t charged = 0;
+
+        void resize(size_t size, size_t alignment) {
+            if (size > SIZE_MAX - (alignment - 1)) { throw std::bad_alloc(); }
+            charged = size + alignment - 1;
+            allocation.reset(new uint8_t[charged]);
+            const uintptr_t address = (uintptr_t) allocation.get();
+            base = allocation.get() + (alignment - address % alignment) % alignment;
+            length = size;
+        }
+        uint8_t * data() { return base; }
+        size_t size() const { return length; }
+    };
+
     struct entry {
-        std::vector<uint8_t>     data;
+        aligned_buffer          data;
         std::shared_future<bool> ready;
         uint64_t                 last_use = 0;
+        uint64_t                 slot = 0;
+        ggml_backend_t           copy_backend = nullptr;
+    };
+
+    struct slice {
+        std::shared_ptr<entry> block;
+        size_t offset;
+        size_t size;
+        uint8_t * data() const { return block->data.data() + offset; }
     };
 
     ggml_ssd_expert_cache(size_t capacity, uint32_t n_workers, bool stats) :
         capacity(capacity), stats_enabled(stats), workers(n_workers) {
+        async_demand = getenv("GGML_MOE_ASYNC_DEMAND") && atoi(getenv("GGML_MOE_ASYNC_DEMAND")) == 1;
+        verify_weights = getenv("GGML_MOE_VERIFY_WEIGHTS") && atoi(getenv("GGML_MOE_VERIFY_WEIGHTS")) == 1;
         GGML_LOG_INFO("ssd_moe_cache: capacity = %.2f MiB, workers = %u\n", capacity/1024.0/1024.0, n_workers);
     }
 
     ~ggml_ssd_expert_cache() {
+        for (const auto & value : entries) {
+            value.second->ready.wait();
+            if (value.second->copy_backend) { ggml_backend_synchronize(value.second->copy_backend); }
+            moe_trace.emit("evict", value.first.tensor->name, value.first.expert, value.second->slot,
+                    value.second->data.charged, "cache_destroy");
+        }
         if (stats_enabled) {
             report(true);
         }
     }
 
-    void register_tensor(const ggml_tensor * tensor, const char * path, uint64_t file_offset) {
+    void register_tensor(const ggml_tensor * tensor, const char * path, uint64_t file_offset,
+            size_t record_size = 0, size_t slice_offset = 0, const ggml_tensor * group = nullptr) {
         std::shared_ptr<ggml_ssd_source_file> file;
         auto file_it = files.find(path);
         if (file_it == files.end()) {
@@ -971,12 +1016,17 @@ public:
         } else {
             file = file_it->second;
         }
-        const source value = { std::move(file), file_offset, tensor };
+        const source value = { std::move(file), file_offset, tensor, group ? group : tensor, record_size, slice_offset };
         sources[tensor] = value;
         sources_by_name[ggml_get_name(tensor)] = value;
     }
 
-    std::vector<std::shared_ptr<entry>> acquire(
+    bool is_packed(const ggml_tensor * tensor) const {
+        const auto it = sources_by_name.find(ggml_get_name(tensor));
+        return it != sources_by_name.end() && it->second.record_size != 0;
+    }
+
+    std::vector<slice> acquire(
             const ggml_tensor * tensor,
             const std::vector<int32_t> & expert_ids,
             int64_t n_expert,
@@ -998,7 +1048,14 @@ public:
         }
 
         const size_t padding = std::min<size_t>(expert_size, 512);
-        const ggml_tensor * cache_tensor = tensor_source.tensor;
+        const ggml_tensor * cache_tensor = tensor_source.group;
+        const size_t alignment = tensor_source.file->alignment;
+        const bool packed = tensor_source.record_size != 0;
+        if (packed && (tensor_source.slice_offset > tensor_source.record_size ||
+                expert_size + padding > tensor_source.record_size - tensor_source.slice_offset)) {
+            GGML_LOG_ERROR("ssd_moe_cache: invalid packed slice for %s\n", tensor->name);
+            return {};
+        }
         size_t missing_bytes = 0;
         std::unordered_set<key, key_hash> requested;
         requested.reserve(expert_ids.size());
@@ -1006,19 +1063,15 @@ public:
             const key k = { cache_tensor, id };
             requested.insert(k);
             if (entries.find(k) == entries.end()) {
-                missing_bytes += expert_size + (id < n_expert - 1 ? padding : 0);
+                const size_t bytes = (packed ? tensor_source.record_size : expert_size + (id < n_expert - 1 ? padding : 0)) + alignment - 1;
+                if (bytes > capacity || missing_bytes > capacity - bytes) { return {}; }
+                missing_bytes += bytes;
             }
         }
 
-        if (missing_bytes > capacity) {
-            GGML_LOG_WARN("ssd_moe_cache: selected experts need %.2f MiB but cache capacity is %.2f MiB; using mmap fallback\n",
-                    missing_bytes/1024.0/1024.0, capacity/1024.0/1024.0);
-            return {};
-        }
-
-        if (resident_bytes + missing_bytes > capacity) {
+        if (missing_bytes > capacity - resident_bytes) {
             ggml_backend_synchronize(backend);
-            while (resident_bytes + missing_bytes > capacity) {
+            while (missing_bytes > capacity - resident_bytes) {
                 auto victim = entries.end();
                 for (auto it = entries.begin(); it != entries.end(); ++it) {
                     if (requested.count(it->first) != 0 || it->second->ready.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
@@ -1031,13 +1084,19 @@ public:
                 if (victim == entries.end()) {
                     return {};
                 }
-                resident_bytes -= victim->second->data.size();
+                // A source can have been copied by another backend in an earlier split.
+                if (victim->second->copy_backend) {
+                    ggml_backend_synchronize(victim->second->copy_backend);
+                }
+                moe_trace.emit("evict", ggml_get_name(victim->first.tensor), victim->first.expert,
+                        victim->second->slot, victim->second->data.charged);
+                resident_bytes -= victim->second->data.charged;
                 entries.erase(victim);
                 n_evictions++;
             }
         }
 
-        std::vector<std::shared_ptr<entry>> result;
+        std::vector<slice> result;
         result.reserve(expert_ids.size());
         const auto source = tensor_source;
         for (int32_t id : expert_ids) {
@@ -1045,26 +1104,42 @@ public:
             auto it = entries.find(k);
             if (it != entries.end()) {
                 n_hits++;
+                moe_trace.emit("hit_or_join", ggml_get_name(cache_tensor), id, it->second->slot);
                 it->second->last_use = ++clock;
-                result.push_back(it->second);
+                result.push_back({it->second, source.slice_offset, expert_size + (id < n_expert - 1 ? padding : 0)});
                 continue;
             }
 
             n_misses++;
-            const size_t read_size = expert_size + (id < n_expert - 1 ? padding : 0);
+            const size_t slice_size = expert_size + (id < n_expert - 1 ? padding : 0);
+            const size_t read_size = packed ? source.record_size : slice_size;
             auto item = std::make_shared<entry>();
-            item->data.resize(read_size);
+            item->data.resize(read_size, alignment);
             item->last_use = ++clock;
-            resident_bytes += read_size;
-            const uint8_t * fallback = (const uint8_t *) cache_tensor->data + (size_t) id * expert_size;
-            item->ready = workers.submit([this, item, source, fallback, id, expert_size, read_size] {
+            item->slot = ++slot_clock;
+            resident_bytes += item->data.charged;
+            const uint8_t * fallback = packed ? nullptr : (const uint8_t *) cache_tensor->data + (size_t) id * expert_size;
+            moe_trace.emit("reserve", ggml_get_name(cache_tensor), id, item->slot, item->data.charged, packed ? "packed_record" : "aligned_slice");
+            moe_trace.emit("enqueue", ggml_get_name(cache_tensor), id, item->slot, read_size);
+            // Avoid a future/entry cycle while keeping a running task's data alive.
+            std::weak_ptr<entry> weak_item = item;
+            item->ready = workers.submit([this, weak_item, source, fallback, id, expert_size, read_size, packed] {
+                const auto target = weak_item.lock();
+                if (!target) { return false; }
                 const auto begin = std::chrono::steady_clock::now();
+                moe_trace.emit("io_submit", ggml_get_name(source.tensor), id, target->slot, read_size);
                 uint64_t physical_bytes = 0;
                 bool direct = false;
-                const bool ok = source.file->read(source.file_offset + (uint64_t) id * expert_size,
-                        item->data.data(), read_size, physical_bytes, direct);
+                uint64_t bounce_bytes = 0;
+                const bool ok = source.file->read(source.file_offset + (uint64_t) id * (packed ? source.record_size : expert_size),
+                        target->data.data(), read_size, physical_bytes, direct, bounce_bytes);
+                if (!ok && packed) {
+                    GGML_LOG_ERROR("ssd_moe_cache: packed read failed for %s expert %d\n", source.tensor->name, id);
+                    moe_trace.emit("io_error", source.tensor->name, id, target->slot, read_size, "packed_read_failed");
+                    return false;
+                }
                 if (!ok) {
-                    memcpy(item->data.data(), fallback, read_size);
+                    memcpy(target->data.data(), fallback, read_size);
                     n_read_fallbacks++;
                 } else {
                     n_disk_bytes += physical_bytes;
@@ -1072,17 +1147,27 @@ public:
                         n_direct_reads++;
                     }
                 }
+                n_bounce_bytes += bounce_bytes;
                 n_logical_bytes += read_size;
+                if (packed) { n_packed_reads++; }
                 n_io_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+                moe_trace.emit("io_complete", ggml_get_name(source.tensor), id, target->slot, physical_bytes,
+                        !ok ? "mmap_fallback" : direct ? "direct_pread" : "buffered_pread");
+                if (verify_weights && !packed) {
+                    const bool equal = memcmp(target->data.data(), fallback, read_size) == 0;
+                    moe_trace.emit("weight_check", ggml_get_name(source.tensor), id, target->slot, read_size, equal ? "pass" : "fail");
+                    if (!equal) { return false; }
+                }
                 return true;
             });
             entries.emplace(k, item);
-            result.push_back(std::move(item));
+            result.push_back({std::move(item), source.slice_offset, slice_size});
         }
 
         for (const auto & item : result) {
-            if (!item->ready.get()) {
-                return {};
+            if (async_demand) { break; }
+            if (!item.block->ready.get()) {
+                return result;
             }
         }
         return result;
@@ -1090,6 +1175,16 @@ public:
 
     void add_backend_copy(size_t bytes) {
         n_backend_bytes += bytes;
+    }
+
+    void add_zero_copy(size_t saved_bytes, size_t control_bytes) {
+        n_backend_saved_bytes += saved_bytes;
+        n_zero_copy_control_bytes += control_bytes;
+        n_zero_copy_binds++;
+    }
+
+    void add_zero_copy_fallback() {
+        n_zero_copy_fallbacks++;
     }
 
     void report(bool final = false) {
@@ -1102,12 +1197,16 @@ public:
         const double hit_rate = accesses ? 100.0 * hits / accesses : 0.0;
         GGML_LOG_INFO("ssd_moe_cache: %s=%" PRIu64 " hit_rate=%.2f%% hits=%" PRIu64 " misses=%" PRIu64
                 " resident=%.2f MiB disk=%.2f MiB logical=%.2f MiB backend_copy=%.2f MiB io=%.3f ms evictions=%" PRIu64
-                " direct_reads=%" PRIu64 " fallbacks=%" PRIu64 "\n",
+                " direct_reads=%" PRIu64 " fallbacks=%" PRIu64 " packed_reads=%" PRIu64 " host_bounce_bytes=%" PRIu64
+                " backend_copy_saved=%.2f MiB zero_copy_binds=%" PRIu64 " zero_copy_control_bytes=%" PRIu64
+                " zero_copy_fallbacks=%" PRIu64 "\n",
                 final ? "final_evals" : "eval", final ? n_evals.load() : ++n_evals,
                 hit_rate, hits, misses, resident_bytes/1024.0/1024.0,
                 n_disk_bytes.load()/1024.0/1024.0, n_logical_bytes.load()/1024.0/1024.0,
                 n_backend_bytes.load()/1024.0/1024.0, n_io_us.load()/1000.0, n_evictions.load(),
-                n_direct_reads.load(), n_read_fallbacks.load());
+                n_direct_reads.load(), n_read_fallbacks.load(), n_packed_reads.load(), n_bounce_bytes.load(),
+                n_backend_saved_bytes.load()/1024.0/1024.0, n_zero_copy_binds.load(), n_zero_copy_control_bytes.load(),
+                n_zero_copy_fallbacks.load());
     }
 
 private:
@@ -1115,6 +1214,9 @@ private:
         std::shared_ptr<ggml_ssd_source_file> file;
         uint64_t                              file_offset;
         const ggml_tensor *                   tensor;
+        const ggml_tensor *                   group;
+        size_t                               record_size;
+        size_t                               slice_offset;
     };
 
     struct key {
@@ -1136,22 +1238,34 @@ private:
     size_t resident_bytes = 0;
     bool stats_enabled;
     uint64_t clock = 0;
+    // Slot identities remain unique across scheduler recreation.
+    static std::atomic<uint64_t> slot_clock;
+    bool async_demand = false;
+    bool verify_weights = false;
     std::unordered_map<std::string, std::shared_ptr<ggml_ssd_source_file>> files;
     std::unordered_map<const ggml_tensor *, source> sources;
     std::unordered_map<std::string, source> sources_by_name;
     std::unordered_map<key, std::shared_ptr<entry>, key_hash> entries;
+    std::atomic<uint64_t> n_packed_reads{0};
+    std::atomic<uint64_t> n_bounce_bytes{0};
     std::atomic<uint64_t> n_hits{0};
     std::atomic<uint64_t> n_misses{0};
     std::atomic<uint64_t> n_evictions{0};
     std::atomic<uint64_t> n_disk_bytes{0};
     std::atomic<uint64_t> n_logical_bytes{0};
     std::atomic<uint64_t> n_backend_bytes{0};
+    std::atomic<uint64_t> n_backend_saved_bytes{0};
+    std::atomic<uint64_t> n_zero_copy_control_bytes{0};
+    std::atomic<uint64_t> n_zero_copy_binds{0};
+    std::atomic<uint64_t> n_zero_copy_fallbacks{0};
     std::atomic<uint64_t> n_io_us{0};
     std::atomic<uint64_t> n_direct_reads{0};
     std::atomic<uint64_t> n_read_fallbacks{0};
     std::atomic<uint64_t> n_evals{0};
     ggml_ssd_worker_pool workers;
 };
+
+std::atomic<uint64_t> ggml_ssd_expert_cache::slot_clock{0};
 
 struct ggml_backend_sched_split {
     int backend_id;
@@ -1352,7 +1466,11 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
-                        if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                        const auto device_type = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b]));
+                        const bool m0_gpu = tensor->op == GGML_OP_MUL_MAT_ID &&
+                            getenv("GGML_MOE_FORCE_GPU") && atoi(getenv("GGML_MOE_FORCE_GPU")) == 1 &&
+                            (device_type == GGML_BACKEND_DEVICE_TYPE_GPU || device_type == GGML_BACKEND_DEVICE_TYPE_IGPU);
+                        if (ggml_backend_supports_op(sched->backends[b], tensor) && (m0_gpu || ggml_backend_offload_op(sched->backends[b], tensor))) {
                             SET_CAUSE(tensor, "1.off");
                             return b;
                         }
@@ -2128,14 +2246,82 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (sched->ssd_cache != nullptr) {
                         auto cached = sched->ssd_cache->acquire(input, selected_ids, n_expert, expert_size, split_backend);
                         if (cached.size() == selected_ids.size()) {
+                            const bool zero_copy_requested = sched->ssd_cache->is_packed(input) &&
+                                getenv("GGML_MOE_ZERO_COPY") && atoi(getenv("GGML_MOE_ZERO_COPY")) == 1;
+                            if (zero_copy_requested) {
+                                std::vector<const void *> pointers(n_expert, cached.front().data());
+                                size_t saved_bytes = 0;
+                                bool ready = true;
+                                for (size_t i = 0; i < selected_ids.size(); ++i) {
+                                    if (!cached[i].block->ready.get()) {
+                                        ready = false;
+                                        break;
+                                    }
+                                    if (cached[i].block->copy_backend && cached[i].block->copy_backend != split_backend) {
+                                        ggml_backend_synchronize(cached[i].block->copy_backend);
+                                    }
+                                    if (getenv("GGML_MOE_VERIFY_WEIGHTS") && atoi(getenv("GGML_MOE_VERIFY_WEIGHTS")) == 1) {
+                                        const size_t expert_offset = (size_t) selected_ids[i] * expert_size;
+                                        const bool equal = memcmp(cached[i].data(), (const uint8_t *) input->data + expert_offset, cached[i].size) == 0;
+                                        moe_trace.emit("weight_check", input->name, selected_ids[i], cached[i].block->slot, cached[i].size, equal ? "pass" : "fail");
+                                        if (!equal) { return GGML_STATUS_FAILED; }
+                                    }
+                                    pointers[selected_ids[i]] = cached[i].data();
+                                    saved_bytes += cached[i].size;
+                                }
+                                using set_expert_ptrs_t = bool (*)(ggml_backend_t, const ggml_tensor *, const ggml_tensor *, const void * const *, size_t);
+                                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(split_backend));
+                                auto set_expert_ptrs = (set_expert_ptrs_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_set_expert_ptrs");
+                                if (ready && set_expert_ptrs && set_expert_ptrs(split_backend, node, input_cpy, pointers.data(), pointers.size())) {
+                                    for (size_t i = 0; i < selected_ids.size(); ++i) {
+                                        cached[i].block->copy_backend = split_backend;
+                                        moe_trace.emit("zero_copy_bind", input->name, selected_ids[i], cached[i].block->slot,
+                                                cached[i].size, ggml_backend_name(split_backend));
+                                    }
+                                    sched->ssd_cache->add_zero_copy(saved_bytes, pointers.size() * sizeof(void *));
+                                    continue;
+                                }
+                                sched->ssd_cache->add_zero_copy_fallback();
+                            }
                             for (size_t i = 0; i < selected_ids.size(); ++i) {
+                                if (!cached[i].block->ready.get()) { return GGML_STATUS_FAILED; }
+                                if (cached[i].block->copy_backend && cached[i].block->copy_backend != split_backend) {
+                                    ggml_backend_synchronize(cached[i].block->copy_backend);
+                                }
                                 const size_t expert_offset = (size_t) selected_ids[i] * expert_size;
+                                if (sched->ssd_cache->is_packed(input) && getenv("GGML_MOE_VERIFY_WEIGHTS") && atoi(getenv("GGML_MOE_VERIFY_WEIGHTS")) == 1) {
+                                    const bool equal = memcmp(cached[i].data(), (const uint8_t *) input->data + expert_offset, cached[i].size) == 0;
+                                    moe_trace.emit("weight_check", input->name, selected_ids[i], cached[i].block->slot, cached[i].size, equal ? "pass" : "fail");
+                                    if (!equal) { return GGML_STATUS_FAILED; }
+                                }
+                                moe_trace.emit("copy_submit", input->name, selected_ids[i], cached[i].block->slot,
+                                        cached[i].size, ggml_backend_name(split_backend));
                                 ggml_backend_tensor_set_async(split_backend, input_cpy,
-                                        cached[i]->data.data(), expert_offset, cached[i]->data.size());
-                                sched->ssd_cache->add_backend_copy(cached[i]->data.size());
+                                        cached[i].data(), expert_offset, cached[i].size);
+                                cached[i].block->copy_backend = split_backend;
+                                if (moe_trace.file) {
+                                    ggml_backend_synchronize(split_backend);
+                                    moe_trace.emit("copy_complete", input->name, selected_ids[i], cached[i].block->slot,
+                                            cached[i].size, "host_observed_backend_sync");
+                                    if (getenv("GGML_MOE_VERIFY_WEIGHTS") && atoi(getenv("GGML_MOE_VERIFY_WEIGHTS")) == 1) {
+                                        std::vector<uint8_t> check(cached[i].size);
+                                        ggml_backend_tensor_get(input_cpy, check.data(), expert_offset, check.size());
+                                        const bool equal = memcmp(check.data(), cached[i].data(), check.size()) == 0;
+                                        moe_trace.emit("copy_check", input->name, selected_ids[i], cached[i].block->slot,
+                                                check.size(), equal ? "pass" : "fail");
+                                        if (!equal) { return GGML_STATUS_FAILED; }
+                                    }
+                                }
+                                sched->ssd_cache->add_backend_copy(cached[i].size);
                             }
                             continue;
                         }
+                        if (sched->ssd_cache->is_packed(input)) {
+                            GGML_LOG_ERROR("ssd_moe_cache: insufficient packed cache capacity for %s (%zu experts); increase cache or reduce batch size\n",
+                                    input->name, selected_ids.size());
+                            return GGML_STATUS_ALLOC_FAILED;
+                        }
+                        moe_trace.emit("cache_fallback", input->name);
                     }
 
                     // group consecutive experts and copy them together
@@ -2145,12 +2331,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        moe_trace.emit("mmap_copy_submit", input->name, first_id, 0,
+                                expert_size_copy + padding_end, ggml_backend_name(split_backend));
+
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                        if (moe_trace.file) {
+                            ggml_backend_synchronize(split_backend);
+                            moe_trace.emit("mmap_copy_complete", input->name, first_id, 0,
+                                    expert_size_copy + padding_end, "host_observed_backend_sync");
+                        }
                         if (sched->ssd_cache != nullptr) {
                             sched->ssd_cache->add_backend_copy(expert_size_copy + padding_end);
                         }
@@ -2195,7 +2389,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        if (moe_trace.file) {
+            // Diagnostic only: node boundaries disable fusion and add synchronization.
+            for (int j = 0; j < split->graph.n_nodes; ++j) {
+                ggml_tensor * node = split->graph.nodes[j];
+                if (node->op == GGML_OP_MUL_MAT_ID) {
+                    ggml_backend_synchronize(split_backend);
+                    ggml_tensor * selected = node->src[2];
+                    std::vector<int32_t> values(ggml_nbytes(selected) / sizeof(int32_t));
+                    ggml_backend_tensor_get(selected, values.data(), 0, ggml_nbytes(selected));
+                    std::string extra = ",\"n_experts\":" + std::to_string(node->src[0]->ne[2]) +
+                        ",\"top_k\":" + std::to_string(selected->ne[0]) + ",\"ids\":[";
+                    for (int64_t t = 0; t < selected->ne[1]; ++t) {
+                        if (t) { extra += ','; }
+                        extra += '[';
+                        for (int64_t k = 0; k < selected->ne[0]; ++k) {
+                            if (k) { extra += ','; }
+                            extra += std::to_string(values[t * selected->nb[1]/sizeof(int32_t) + k * selected->nb[0]/sizeof(int32_t)]);
+                        }
+                        extra += ']';
+                    }
+                    extra += ']';
+                    moe_trace.emit("consumer_begin", node->src[0]->name, -1, 0, ggml_nbytes(node->src[0]),
+                            ggml_backend_name(split_backend), extra.c_str());
+                }
+                struct ggml_cgraph view = ggml_graph_view(&split->graph, j, j + 1);
+                const auto status = ggml_backend_graph_compute_async(split_backend, &view);
+                if (status != GGML_STATUS_SUCCESS) { return status; }
+                ggml_backend_synchronize(split_backend);
+                if (node->op == GGML_OP_MUL_MAT_ID) {
+                    moe_trace.emit("consumer_end", node->src[0]->name, -1, 0, 0, ggml_backend_name(split_backend));
+                }
+            }
+        } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -2338,6 +2564,13 @@ void ggml_backend_sched_register_ssd_tensor(
     GGML_ASSERT(tensor);
     GGML_ASSERT(path);
     sched->ssd_cache->register_tensor(tensor, path, file_offset);
+}
+
+void ggml_backend_sched_register_ssd_packed_tensor(
+        ggml_backend_sched_t sched, const ggml_tensor * tensor, const char * path,
+        uint64_t file_offset, size_t record_size, size_t slice_offset, const ggml_tensor * group) {
+    GGML_ASSERT(sched && sched->ssd_cache && tensor && path && group && record_size);
+    sched->ssd_cache->register_tensor(tensor, path, file_offset, record_size, slice_offset, group);
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {

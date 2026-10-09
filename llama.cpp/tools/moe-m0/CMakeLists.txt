@@ -1,0 +1,6 @@
+add_executable(llama-moe-m0 moe-m0.cpp)
+target_link_libraries(llama-moe-m0 PRIVATE llama vendor::nlohmann ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(llama-moe-m0 PRIVATE cxx_std_17)
+if (LLAMA_TOOLS_INSTALL)
+    install(TARGETS llama-moe-m0 RUNTIME)
+endif()

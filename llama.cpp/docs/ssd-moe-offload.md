@@ -1,5 +1,9 @@
 # SSD MoE offload V1 to V2.2
 
+The optional packed-weight extension is documented in [ssd-moe-pack.md](ssd-moe-pack.md).
+It adds one aligned gate/up/down record per expert and direct reads into shared cache storage.
+The V1/V2 descriptions below describe the original GGUF-source path.
+
 ## Goal and scope
 
 V1 validates the minimum SSD-offload data path for Qwen3 MoE on DGX01:

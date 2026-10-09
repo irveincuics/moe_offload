@@ -39,9 +39,11 @@ struct mmf_ids_data {
     const int32_t * expert_bounds_dev = nullptr;
     int n_experts = 0;
     int sis1 = 0;
+    const void * const * expert_ptrs = nullptr;
 };
 
-void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const void * const * expert_ptrs = nullptr);
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
 
@@ -52,7 +54,8 @@ static __global__ void mul_mat_f(
         const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
         const int stride_col_id, const int stride_row_id,
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
-        const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+        const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const void * const * __restrict__ expert_ptrs) {
 // TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 #if defined(AMD_WMMA_AVAILABLE)
@@ -110,7 +113,8 @@ static __global__ void mul_mat_f(
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
 
-    x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x  + row0*stride_row ;
+    x = expert_ptrs && has_ids ? (const T *) expert_ptrs[channel_x] + int64_t(sample_x)*stride_sample_x + row0*stride_row :
+        x + int64_t(sample_x)*stride_sample_x + channel_x*stride_channel_x + row0*stride_row;
     y   += int64_t(sample_y)  *stride_sample_y   + (has_ids ? 0 : channel_y  *stride_channel_y);
     dst += int64_t(sample_dst)*stride_sample_dst + (has_ids ? 0 : channel_dst*stride_channel_dst);
 
@@ -297,7 +301,7 @@ static __global__ void mul_mat_f(
         ncols, ncols_dst_total, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
         stride_col_id, stride_row_id,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, expert_ptrs);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -312,7 +316,7 @@ static __global__ void mul_mat_f_ids(
         const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 sis1_fd, const uint3 nch_fd) {
+        const uint3 sis1_fd, const uint3 nch_fd, const void * const * __restrict__ expert_ptrs) {
 // TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 #if defined(AMD_WMMA_AVAILABLE)
@@ -371,7 +375,8 @@ static __global__ void mul_mat_f_ids(
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
 
-    x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x  + row0*stride_row;
+    x = expert_ptrs ? (const T *) expert_ptrs[channel_x] + int64_t(sample_x)*stride_sample_x + row0*stride_row :
+        x + int64_t(sample_x)*stride_sample_x + channel_x*stride_channel_x + row0*stride_row;
     y   += int64_t(sample_y)  *stride_sample_y;
     dst += int64_t(sample_dst)*stride_sample_dst;
 
@@ -583,7 +588,7 @@ static __global__ void mul_mat_f_ids(
     GGML_UNUSED_VARS(x, y, ids_src_compact, ids_dst_compact, expert_bounds, dst,
         ncols, ncols_dst_total, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, sis1_fd, nch_fd);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, sis1_fd, nch_fd, expert_ptrs);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -617,7 +622,7 @@ static inline void mul_mat_f_switch_ids(
             ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-            sis1_fd, nch_fd);
+            sis1_fd, nch_fd, ids_data->expert_ptrs);
     } else if (ids) {
         const int64_t col_tiles = (ncols_dst + cols_per_block - 1) / cols_per_block;
         dim3 block_nums_ids = block_nums;
@@ -626,12 +631,12 @@ static inline void mul_mat_f_switch_ids(
         mul_mat_f<T, rows_per_block, cols_per_block, nwarps, true><<<block_nums_ids, block_dims, nbytes_shared_total, stream>>>
             (x, y, ids, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
              stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_data ? ids_data->expert_ptrs : nullptr);
     } else {
         mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false><<<block_nums, block_dims, nbytes_shared_total, stream>>>
             (x, y, ids, dst, ncols_x, cols_per_block, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
              stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, nullptr);
     }
 }
 

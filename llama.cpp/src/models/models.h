@@ -584,6 +584,11 @@ struct llama_model_qwen3 : public llama_model_base {
 
 
 struct llama_model_qwen3moe : public llama_model_base {
+    ~llama_model_qwen3moe() override;
+    ggml_context * prefetch_ctx = nullptr;
+    ggml_backend_buffer_t prefetch_buffer = nullptr;
+    ggml_tensor * prefetch_down = nullptr;
+    std::vector<ggml_tensor *> prefetch_up, prefetch_bias;
     llama_model_qwen3moe(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;

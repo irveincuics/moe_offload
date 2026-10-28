@@ -36,6 +36,10 @@
 #include <vector>
 
 #include "ggml-moe-trace.h"
+#include "ggml-moe-history.h"
+
+static int64_t moe_prefetch_decode_step = -1;
+void ggml_backend_moe_prefetch_step(int64_t decode_step) { moe_prefetch_decode_step = decode_step; }
 
 #if defined(__linux__)
 #include <errno.h>
@@ -801,17 +805,28 @@ public:
         for (uint32_t i = 0; i < n_workers; ++i) {
             workers.emplace_back([this] {
                 for (;;) {
-                    std::function<void()> task;
+                    work task;
                     {
                         std::unique_lock<std::mutex> lock(mutex);
-                        condition.wait(lock, [this] { return stopping || !tasks.empty(); });
-                        if (stopping && tasks.empty()) {
+                        condition.wait(lock, [this] {
+                            return !tasks.empty() || (!speculative.empty() && active_speculative == 0) ||
+                                (stopping && speculative.empty());
+                        });
+                        if (stopping && tasks.empty() && speculative.empty()) {
                             return;
                         }
-                        task = std::move(tasks.front());
-                        tasks.pop_front();
+                        if (!tasks.empty()) {
+                            task = std::move(tasks.front()); tasks.pop_front();
+                        } else {
+                            task = std::move(speculative.front()); speculative.pop_front(); ++active_speculative;
+                        }
                     }
-                    task();
+                    task.fn();
+                    if (task.speculative) {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        --active_speculative;
+                    }
+                    condition.notify_all();
                 }
             });
         }
@@ -828,20 +843,34 @@ public:
         }
     }
 
-    std::shared_future<bool> submit(std::function<bool()> fn) {
+    std::shared_future<bool> submit(std::function<bool()> fn, bool low_priority = false, uint64_t tag = 0) {
         auto task = std::make_shared<std::packaged_task<bool()>>(std::move(fn));
         std::shared_future<bool> result = task->get_future().share();
         {
             std::lock_guard<std::mutex> lock(mutex);
-            tasks.emplace_back([task] { (*task)(); });
+            (low_priority ? speculative : tasks).push_back({[task] { (*task)(); }, tag, low_priority});
         }
         condition.notify_one();
         return result;
     }
 
+    void promote(uint64_t tag) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = speculative.begin(); it != speculative.end(); ++it) {
+            if (it->tag == tag) {
+                it->speculative = false;
+                tasks.push_front(std::move(*it)); speculative.erase(it);
+                condition.notify_all();
+                break;
+            }
+        }
+    }
+
 private:
     std::vector<std::thread>       workers;
-    std::deque<std::function<void()>> tasks;
+    struct work { std::function<void()> fn; uint64_t tag = 0; bool speculative = false; };
+    std::deque<work> tasks, speculative;
+    int active_speculative = 0;
     std::mutex                     mutex;
     std::condition_variable        condition;
     bool                           stopping = false;
@@ -977,6 +1006,10 @@ public:
         uint64_t                 last_use = 0;
         uint64_t                 slot = 0;
         ggml_backend_t           copy_backend = nullptr;
+        bool                     prefetched = false;
+        bool                     demanded = false;
+        int64_t                  target_step = -1;
+        int                      target_layer = -1;
     };
 
     struct slice {
@@ -990,18 +1023,55 @@ public:
         capacity(capacity), stats_enabled(stats), workers(n_workers) {
         async_demand = getenv("GGML_MOE_ASYNC_DEMAND") && atoi(getenv("GGML_MOE_ASYNC_DEMAND")) == 1;
         verify_weights = getenv("GGML_MOE_VERIFY_WEIGHTS") && atoi(getenv("GGML_MOE_VERIFY_WEIGHTS")) == 1;
+        if (const char * mode = getenv("GGML_MOE_PREFETCH")) { prefetch_mode = mode; }
+        if (prefetch_mode != "none" && prefetch_mode[0] != 'b' && prefetch_mode != "oracle") {
+            const char * filename = getenv("GGML_MOE_HISTORY_BANK");
+            if (!filename) { GGML_ABORT("prefetch requires GGML_MOE_HISTORY_BANK"); }
+            history_bank = std::make_shared<moe_history::bank>(filename);
+            if (history_bank->storage_bytes() > 4 * 1024 * 1024) {
+                GGML_ABORT("history bank exceeds experimental allowance");
+            }
+            moe_history::config options;
+            options.mode = prefetch_mode;
+            if (const char * v = getenv("GGML_MOE_PREFETCH_DISTANCE")) { options.distance = std::stoi(v); }
+            if (const char * v = getenv("GGML_MOE_PREFETCH_COUNT")) { prefetch_count = std::stoi(v); }
+            if (prefetch_count < 1 || prefetch_count > 128) { GGML_ABORT("invalid prefetch count"); }
+            predictor.reset(new moe_history::predictor(history_bank, options));
+        }
+        if (prefetch_mode == "oracle") {
+            history_bank = std::make_shared<moe_history::bank>(getenv("GGML_MOE_HISTORY_BANK"));
+            for (const auto & request : history_bank->requests) {
+                if (request.id == getenv("GGML_MOE_REQUEST_ID")) { oracle_request = &request; }
+            }
+            GGML_ASSERT(oracle_request);
+        }
+        if (prefetch_mode[0] == 'b') {
+            prefetch_count = atoi(getenv("GGML_MOE_PREFETCH_COUNT"));
+            prefetch_distance = atoi(getenv("GGML_MOE_PREFETCH_DISTANCE"));
+            b_margin = atof(getenv("GGML_MOE_B_MARGIN"));
+        }
+        if (const char * path = getenv("GGML_MOE_ROUTE_DUMP")) {
+            if (path[0]) { route_dump.open(path, std::ios::binary); }
+        }
         GGML_LOG_INFO("ssd_moe_cache: capacity = %.2f MiB, workers = %u\n", capacity/1024.0/1024.0, n_workers);
     }
 
     ~ggml_ssd_expert_cache() {
         for (const auto & value : entries) {
             value.second->ready.wait();
+            if (value.second->prefetched && !value.second->demanded) { ++pf_unused; }
             if (value.second->copy_backend) { ggml_backend_synchronize(value.second->copy_backend); }
             moe_trace.emit("evict", value.first.tensor->name, value.first.expert, value.second->slot,
                     value.second->data.charged, "cache_destroy");
         }
         if (stats_enabled) {
             report(true);
+            GGML_LOG_INFO("moe_prefetch: mode=%s demand=%" PRIu64 " miss=%" PRIu64 " natural=%" PRIu64
+                    " issued=%" PRIu64 " ready=%" PRIu64 " late=%" PRIu64 " unused=%" PRIu64
+                    " skipped=%" PRIu64 " bytes=%" PRIu64 " predict_us=%" PRIu64
+                    " wait_us=%" PRIu64 " reclaim_us=%" PRIu64 " peak_bytes=%zu score_sync_us=%" PRIu64 " score_events=%" PRIu64 "\n",
+                    prefetch_mode.c_str(), pf_demand, pf_miss, pf_natural, pf_issued, pf_ready, pf_late,
+                    pf_unused, pf_skipped, pf_bytes, pf_predict_us, pf_wait_us, pf_reclaim_us, peak_bytes, pf_score_sync_us, pf_score_events);
         }
     }
 
@@ -1019,6 +1089,10 @@ public:
         const source value = { std::move(file), file_offset, tensor, group ? group : tensor, record_size, slice_offset };
         sources[tensor] = value;
         sources_by_name[ggml_get_name(tensor)] = value;
+        int layer = -1;
+        if (record_size && slice_offset == 0 && sscanf(tensor->name, "blk.%d.", &layer) == 1) {
+            layer_sources[layer] = tensor;
+        }
     }
 
     bool is_packed(const ggml_tensor * tensor) const {
@@ -1031,7 +1105,7 @@ public:
             const std::vector<int32_t> & expert_ids,
             int64_t n_expert,
             size_t expert_size,
-            ggml_backend_t backend) {
+            ggml_backend_t backend, bool speculative = false) {
         source tensor_source;
         const auto source_it = sources.find(tensor);
         if (source_it != sources.end()) {
@@ -1051,6 +1125,31 @@ public:
         const ggml_tensor * cache_tensor = tensor_source.group;
         const size_t alignment = tensor_source.file->alignment;
         const bool packed = tensor_source.record_size != 0;
+        int layer = -1;
+        sscanf(tensor->name, "blk.%d.", &layer);
+        if (!speculative && packed && moe_prefetch_decode_step >= 0 &&
+                (last_demand_step != moe_prefetch_decode_step || last_demand_layer != layer)) {
+            last_demand_step = moe_prefetch_decode_step; last_demand_layer = layer;
+            if (route_dump.is_open()) {
+                int32_t record[10] = {int32_t(moe_prefetch_decode_step), layer};
+                GGML_ASSERT(expert_ids.size() == 8);
+                std::copy(expert_ids.begin(), expert_ids.end(), record + 2);
+                route_dump.write((char *) record, sizeof(record));
+            }
+
+            for (int32_t id : expert_ids) {
+                ++pf_demand;
+                const auto it = entries.find({cache_tensor, id});
+                if (it == entries.end()) { ++pf_miss; continue; }
+                auto & item = *it->second;
+                if (item.prefetched && !item.demanded) {
+                    const bool ready = item.ready.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+                    if (ready) { ++pf_ready; } else { ++pf_late; workers.promote(item.slot); }
+                    speculative_bytes -= item.data.charged;
+                    item.demanded = true;
+                } else { ++pf_natural; }
+            }
+        }
         if (packed && (tensor_source.slice_offset > tensor_source.record_size ||
                 expert_size + padding > tensor_source.record_size - tensor_source.slice_offset)) {
             GGML_LOG_ERROR("ssd_moe_cache: invalid packed slice for %s\n", tensor->name);
@@ -1070,11 +1169,25 @@ public:
         }
 
         if (missing_bytes > capacity - resident_bytes) {
-            ggml_backend_synchronize(backend);
+            const auto reclaim_start = std::chrono::steady_clock::now();
+            if (!speculative) {
+                ggml_backend_synchronize(backend);
+                for (auto & item : entries) {
+                    if (item.second->copy_backend == backend) { item.second->copy_backend = nullptr; }
+                }
+            }
             while (missing_bytes > capacity - resident_bytes) {
                 auto victim = entries.end();
                 for (auto it = entries.begin(); it != entries.end(); ++it) {
-                    if (requested.count(it->first) != 0 || it->second->ready.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                    if (requested.count(it->first) != 0 || (speculative && (it->second->copy_backend ||
+                            (it->second->prefetched && !it->second->demanded))) ||
+                            it->second->ready.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                        continue;
+                    }
+                    const auto & item = *it->second;
+                    if ((prefetch_mode == "bgp" || prefetch_mode == "bgu") && item.prefetched && !item.demanded &&
+                            (item.target_step > moe_prefetch_decode_step ||
+                             (item.target_step == moe_prefetch_decode_step && item.target_layer >= layer))) {
                         continue;
                     }
                     if (victim == entries.end() || it->second->last_use < victim->second->last_use) {
@@ -1082,6 +1195,12 @@ public:
                     }
                 }
                 if (victim == entries.end()) {
+                    if (!speculative) {
+                        auto waiting = std::find_if(entries.begin(), entries.end(), [&](const auto & item) {
+                            return !requested.count(item.first) && item.second->ready.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+                        });
+                        if (waiting != entries.end()) { waiting->second->ready.wait(); continue; }
+                    }
                     return {};
                 }
                 // A source can have been copied by another backend in an earlier split.
@@ -1091,9 +1210,13 @@ public:
                 moe_trace.emit("evict", ggml_get_name(victim->first.tensor), victim->first.expert,
                         victim->second->slot, victim->second->data.charged);
                 resident_bytes -= victim->second->data.charged;
+                if (victim->second->prefetched && !victim->second->demanded) {
+                    speculative_bytes -= victim->second->data.charged; ++pf_unused;
+                }
                 entries.erase(victim);
                 n_evictions++;
             }
+            pf_reclaim_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - reclaim_start).count();
         }
 
         std::vector<slice> result;
@@ -1103,6 +1226,7 @@ public:
             const key k = { cache_tensor, id };
             auto it = entries.find(k);
             if (it != entries.end()) {
+                if (speculative) { return {}; }
                 n_hits++;
                 moe_trace.emit("hit_or_join", ggml_get_name(cache_tensor), id, it->second->slot);
                 it->second->last_use = ++clock;
@@ -1115,9 +1239,14 @@ public:
             const size_t read_size = packed ? source.record_size : slice_size;
             auto item = std::make_shared<entry>();
             item->data.resize(read_size, alignment);
-            item->last_use = ++clock;
+            item->last_use = speculative ? 0 : ++clock;
+            item->prefetched = speculative;
             item->slot = ++slot_clock;
             resident_bytes += item->data.charged;
+            peak_bytes = std::max(peak_bytes, resident_bytes);
+            if (speculative) {
+                speculative_bytes += item->data.charged; ++pf_issued; pf_bytes += read_size;
+            }
             const uint8_t * fallback = packed ? nullptr : (const uint8_t *) cache_tensor->data + (size_t) id * expert_size;
             moe_trace.emit("reserve", ggml_get_name(cache_tensor), id, item->slot, item->data.charged, packed ? "packed_record" : "aligned_slice");
             moe_trace.emit("enqueue", ggml_get_name(cache_tensor), id, item->slot, read_size);
@@ -1159,18 +1288,119 @@ public:
                     if (!equal) { return false; }
                 }
                 return true;
-            });
+            }, speculative, item->slot);
             entries.emplace(k, item);
             result.push_back({std::move(item), source.slice_offset, slice_size});
         }
 
         for (const auto & item : result) {
-            if (async_demand) { break; }
+            if (async_demand || speculative) { break; }
             if (!item.block->ready.get()) {
                 return result;
             }
         }
         return result;
+    }
+
+    void prefetch_after_demand(const ggml_tensor * tensor, const std::vector<int32_t> & ids, ggml_backend_t backend) {
+        if ((!predictor && !oracle_request) || moe_prefetch_decode_step < 0 || !is_packed(tensor)) { return; }
+        int layer = -1;
+        if (sscanf(tensor->name, "blk.%d.", &layer) != 1 ||
+                (last_predict_step == moe_prefetch_decode_step && last_predict_layer == layer)) { return; }
+        last_predict_step = moe_prefetch_decode_step; last_predict_layer = layer;
+        expire_predictions(layer);
+        const auto begin = std::chrono::steady_clock::now();
+        moe_history::route observed;
+        for (int id : ids) { observed.add(id); }
+        if (oracle_request) {
+            const auto & actual = oracle_request->tokens.at(moe_prefetch_decode_step).at(layer);
+            GGML_ASSERT(actual.lo == observed.lo && actual.hi == observed.hi);
+            const int target = (layer + 4) % 48;
+            const int64_t step = moe_prefetch_decode_step + (layer + 4 >= 48);
+            if (step >= (int64_t) oracle_request->tokens.size()) { return; }
+            const auto & future = oracle_request->tokens[step][target];
+            std::vector<int> ids;
+            for (int e = 0; e < 128; ++e) { if (future.has(e)) { ids.push_back(e); } }
+            submit_predictions(target, step, ids, backend);
+            return;
+        }
+        predictor->observe(layer, observed);
+        const auto ranked = moe_history::predictor::rank(predictor->predict());
+        pf_predict_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+        submit_predictions(predictor->target_layer(), moe_prefetch_decode_step + predictor->next_token(), ranked, backend);
+    }
+
+    void expire_predictions(int layer) {
+        for (auto it = entries.begin(); it != entries.end();) {
+            auto & item = *it->second;
+            if (item.prefetched && !item.demanded && !item.copy_backend &&
+                    (item.target_step < moe_prefetch_decode_step ||
+                     (item.target_step == moe_prefetch_decode_step && item.target_layer <= layer)) &&
+                    item.ready.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                resident_bytes -= item.data.charged; speculative_bytes -= item.data.charged; ++pf_unused;
+                moe_trace.emit("evict", it->first.tensor->name, it->first.expert, item.slot, item.data.charged, "prediction_expired");
+                it = entries.erase(it);
+            } else { ++it; }
+        }
+    }
+
+    void submit_predictions(int target_layer, int64_t target_step, const std::vector<int> & ranked, ggml_backend_t backend) {
+        const auto target = layer_sources.find(target_layer);
+        if (target == layer_sources.end()) { return; }
+        const auto & source = sources.at(target->second);
+        const size_t charged = source.record_size + source.file->alignment - 1;
+        const size_t reserve = 16 * charged;
+        const size_t limit = std::min<size_t>((prefetch_mode.compare(0, 2, "bg") == 0 ? 4 * charged : 128 * 1024 * 1024), capacity > reserve ? capacity - reserve : 0);
+        int submitted = 0;
+        for (int id : ranked) {
+            if (entries.count({source.group, id})) { continue; }
+            if (submitted >= prefetch_count) { break; }
+            if (charged > limit || speculative_bytes > limit - charged) { ++pf_skipped; break; }
+            const size_t expert_size = ggml_nbytes(source.tensor) / source.tensor->ne[2];
+            const auto fetched = acquire(source.tensor, {id}, source.tensor->ne[2], expert_size, backend, true);
+            if (fetched.empty()) { ++pf_skipped; break; }
+            fetched[0].block->target_step = target_step;
+            fetched[0].block->target_layer = target_layer;
+            ++submitted;
+            moe_trace.emit("prefetch_submit", source.tensor->name, id, fetched[0].block->slot, source.record_size, prefetch_mode.c_str());
+        }
+    }
+
+    bool prefetch_mode_is_b() const { return prefetch_mode[0] == 'b'; }
+
+    bool needs_score(const ggml_tensor * tensor) const {
+        return prefetch_mode[0] == 'b' && moe_prefetch_decode_step >= 0 &&
+            strncmp(tensor->name, "moe_prefetch_score-", 19) == 0;
+    }
+
+    void consume_score(ggml_tensor * tensor, ggml_backend_t backend, uint64_t sync_us) {
+        int layer = -1;
+        sscanf(tensor->name, "moe_prefetch_score-%d", &layer);
+        std::vector<float> values(tensor->ne[0]);
+        ggml_backend_tensor_get(tensor, values.data(), 0, values.size()*sizeof(float));
+        pf_score_sync_us += sync_us; ++pf_score_events;
+        const auto begin = std::chrono::steady_clock::now();
+        expire_predictions(layer - 1);
+        std::vector<int> ranked(values.size());
+        for (size_t i = 0; i < ranked.size(); ++i) { ranked[i] = i; }
+        std::sort(ranked.begin(), ranked.end(), [&](int a, int b) { return values[a] != values[b] ? values[a] > values[b] : a < b; });
+        if (prefetch_mode.compare(0, 2, "bg") == 0) {
+            const float boundary = values[ranked[7]];
+            ranked.resize(8);
+            ranked.erase(std::remove_if(ranked.begin(), ranked.end(), [&](int id) { return values[id] - boundary < b_margin; }), ranked.end());
+        }
+        pf_predict_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+        submit_predictions((layer + prefetch_distance) % 48,
+                moe_prefetch_decode_step + (layer + prefetch_distance >= 48), ranked, backend);
+    }
+
+    bool wait_ready(const std::shared_ptr<entry> & item) {
+        const auto begin = std::chrono::steady_clock::now();
+        const bool ok = item->ready.get();
+        if (moe_prefetch_decode_step >= 0) {
+            pf_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+        }
+        return ok;
     }
 
     void add_backend_copy(size_t bytes) {
@@ -1242,6 +1472,20 @@ private:
     static std::atomic<uint64_t> slot_clock;
     bool async_demand = false;
     bool verify_weights = false;
+    std::string prefetch_mode = "none";
+    std::ofstream route_dump;
+    int prefetch_count = 4, prefetch_distance = 4;
+    double b_margin = 0;
+    uint64_t pf_score_sync_us = 0, pf_score_events = 0;
+    std::shared_ptr<const moe_history::bank> history_bank;
+    std::unique_ptr<moe_history::predictor> predictor;
+    const moe_history::request * oracle_request = nullptr;
+    std::unordered_map<int, const ggml_tensor *> layer_sources;
+    size_t speculative_bytes = 0, peak_bytes = 0;
+    int64_t last_demand_step = -2, last_predict_step = -2;
+    int last_demand_layer = -1, last_predict_layer = -1;
+    uint64_t pf_demand = 0, pf_miss = 0, pf_natural = 0, pf_issued = 0, pf_ready = 0, pf_late = 0;
+    uint64_t pf_unused = 0, pf_skipped = 0, pf_bytes = 0, pf_predict_us = 0, pf_wait_us = 0, pf_reclaim_us = 0;
     std::unordered_map<std::string, std::shared_ptr<ggml_ssd_source_file>> files;
     std::unordered_map<const ggml_tensor *, source> sources;
     std::unordered_map<std::string, source> sources_by_name;
@@ -2253,7 +2497,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 size_t saved_bytes = 0;
                                 bool ready = true;
                                 for (size_t i = 0; i < selected_ids.size(); ++i) {
-                                    if (!cached[i].block->ready.get()) {
+                                    if (!sched->ssd_cache->wait_ready(cached[i].block)) {
                                         ready = false;
                                         break;
                                     }
@@ -2279,12 +2523,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                                 cached[i].size, ggml_backend_name(split_backend));
                                     }
                                     sched->ssd_cache->add_zero_copy(saved_bytes, pointers.size() * sizeof(void *));
+                                    sched->ssd_cache->prefetch_after_demand(input, selected_ids, split_backend);
                                     continue;
                                 }
                                 sched->ssd_cache->add_zero_copy_fallback();
                             }
                             for (size_t i = 0; i < selected_ids.size(); ++i) {
-                                if (!cached[i].block->ready.get()) { return GGML_STATUS_FAILED; }
+                                if (!sched->ssd_cache->wait_ready(cached[i].block)) { return GGML_STATUS_FAILED; }
                                 if (cached[i].block->copy_backend && cached[i].block->copy_backend != split_backend) {
                                     ggml_backend_synchronize(cached[i].block->copy_backend);
                                 }
@@ -2314,6 +2559,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 }
                                 sched->ssd_cache->add_backend_copy(cached[i].size);
                             }
+                            sched->ssd_cache->prefetch_after_demand(input, selected_ids, split_backend);
                             continue;
                         }
                         if (sched->ssd_cache->is_packed(input)) {
@@ -2417,11 +2663,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 const auto status = ggml_backend_graph_compute_async(split_backend, &view);
                 if (status != GGML_STATUS_SUCCESS) { return status; }
                 ggml_backend_synchronize(split_backend);
+                if (sched->ssd_cache && sched->ssd_cache->needs_score(node)) {
+                    sched->ssd_cache->consume_score(node, split_backend, 0);
+                }
                 if (node->op == GGML_OP_MUL_MAT_ID) {
                     moe_trace.emit("consumer_end", node->src[0]->name, -1, 0, 0, ggml_backend_name(split_backend));
                 }
             }
-        } else if (!sched->callback_eval) {
+        } else if (!sched->callback_eval && !(sched->ssd_cache && sched->ssd_cache->prefetch_mode_is_b())) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -2432,14 +2681,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
                 // check if the user needs data from this node
-                bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                bool need = (sched->callback_eval && sched->callback_eval(t, true, sched->callback_eval_user_data)) ||
+                    (sched->ssd_cache && sched->ssd_cache->needs_score(t));
 
                 int j1 = j0;
 
                 // determine the range [j0, j1] of nodes that can be computed together
                 while (!need && j1 < split->graph.n_nodes - 1) {
                     t = split->graph.nodes[++j1];
-                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                    need = (sched->callback_eval && sched->callback_eval(t, true, sched->callback_eval_user_data)) ||
+                        (sched->ssd_cache && sched->ssd_cache->needs_score(t));
                 }
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
@@ -2450,9 +2701,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
-
-                if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                const auto sync_begin = std::chrono::steady_clock::now();
+                if (need || sched->callback_eval) { ggml_backend_synchronize(split_backend); }
+                if (sched->ssd_cache && sched->ssd_cache->needs_score(t)) {
+                    sched->ssd_cache->consume_score(t, split_backend,
+                        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - sync_begin).count());
+                }
+                if (need && sched->callback_eval && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
                 }
 

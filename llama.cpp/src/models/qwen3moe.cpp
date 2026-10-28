@@ -1,4 +1,12 @@
 #include "models.h"
+#include "ggml-alloc.h"
+#include <cstdlib>
+#include <fstream>
+#include <vector>
+
+llama_model_qwen3moe::~llama_model_qwen3moe() {
+    if (prefetch_ctx) { ggml_backend_buffer_free(prefetch_buffer); ggml_free(prefetch_ctx); }
+}
 
 void llama_model_qwen3moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
@@ -13,6 +21,36 @@ void llama_model_qwen3moe::load_arch_hparams(llama_model_loader & ml) {
 
 void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
+    const char * adapter = getenv("GGML_MOE_B_ADAPTER");
+    if (adapter && adapter[0]) {
+        std::ifstream in(adapter, std::ios::binary);
+        uint32_t shape[4];
+        in.read((char *) shape, sizeof(shape));
+        GGML_ASSERT(in && shape[0] == 0x42505231 && shape[1] == uint32_t(n_embd) && shape[2] == uint32_t(n_layer));
+        const int rank = shape[3];
+        prefetch_ctx = ggml_init({size_t(2*n_layer + 1)*ggml_tensor_overhead() + 1024, nullptr, true});
+        prefetch_down = ggml_new_tensor_2d(prefetch_ctx, GGML_TYPE_F32, n_embd, rank);
+        ggml_set_name(prefetch_down, "prefetch_down");
+        std::vector<ggml_tensor *> tensors = {prefetch_down};
+        for (int l = 0; l < n_layer; ++l) {
+            auto * up = ggml_new_tensor_2d(prefetch_ctx, GGML_TYPE_F32, rank, n_expert);
+            auto * bias = ggml_new_tensor_1d(prefetch_ctx, GGML_TYPE_F32, n_expert);
+            ggml_format_name(up, "prefetch_up_%d", l);
+            ggml_format_name(bias, "prefetch_bias_%d", l);
+            prefetch_up.push_back(up); prefetch_bias.push_back(bias);
+            tensors.push_back(up); tensors.push_back(bias);
+        }
+        prefetch_buffer = ggml_backend_alloc_ctx_tensors_from_buft(prefetch_ctx,
+                ggml_backend_dev_buffer_type(dev_layer(0)));
+        ggml_backend_buffer_set_usage(prefetch_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (auto * tensor : tensors) {
+            std::vector<float> values(ggml_nelements(tensor));
+            in.read((char *) values.data(), ggml_nbytes(tensor));
+            GGML_ASSERT(in);
+            ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
+        }
+    }
+
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -133,6 +171,24 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].ffn_norm, NULL,
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
+
+        const char * prefetch = getenv("GGML_MOE_PREFETCH");
+        if (prefetch && prefetch[0] == 'b' && cur->ne[1] == 1 &&
+                !(std::string(prefetch) == "bgu" && il + atoi(getenv("GGML_MOE_PREFETCH_DISTANCE")) >= n_layer)) {
+            const int distance = atoi(getenv("GGML_MOE_PREFETCH_DISTANCE"));
+            const int target = (il + distance) % n_layer;
+            auto * prediction = ggml_mul_mat(ctx0, model.layers[target].ffn_gate_inp, cur);
+            const auto & qm = static_cast<const llama_model_qwen3moe &>(model);
+            if (qm.prefetch_down) {
+                auto * low = ggml_mul_mat(ctx0, qm.prefetch_down, cur);
+                auto * correction = ggml_mul_mat(ctx0, qm.prefetch_up[il], low);
+                correction = ggml_add(ctx0, correction, qm.prefetch_bias[il]);
+                prediction = ggml_add(ctx0, prediction, correction);
+            }
+            cb(prediction, "moe_prefetch_score", il);
+            ggml_build_forward_expand(gf, prediction);
+        }
+
 
         ggml_tensor * moe_out =
             build_moe_ffn(cur,

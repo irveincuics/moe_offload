@@ -62,8 +62,31 @@ static void env_flag(const char * name, bool value) {
 
 static void quiet_log(enum ggml_log_level level, const char * text, void *) {
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR ||
-            std::string(text).find("ssd_moe_cache: final_evals=") == 0) { fputs(text, stderr); }
+            std::string(text).find("ssd_moe_cache: final_evals=") == 0 ||
+            std::string(text).find("moe_prefetch:") == 0) { fputs(text, stderr); }
 }
+
+struct feature_capture {
+    std::ofstream file;
+    int32_t step = -1;
+    static bool callback(ggml_tensor * tensor, bool ask, void * data) {
+        auto & capture = *(feature_capture *) data;
+        int layer = -1, kind = -1;
+        if (sscanf(tensor->name, "ffn_norm-%d", &layer) == 1) { kind = 0; }
+        else if (sscanf(tensor->name, "ffn_moe_logits-%d", &layer) == 1) { kind = 1; }
+        else if (sscanf(tensor->name, "moe_prefetch_score-%d", &layer) == 1) { kind = 2; }
+        const bool wanted = capture.step >= 0 && kind >= 0 && tensor->ne[1] == 1;
+        if (ask) { return wanted; }
+        if (wanted) {
+            std::vector<float> values(ggml_nelements(tensor));
+            ggml_backend_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
+            int32_t header[] = {capture.step, layer, kind, (int32_t) values.size()};
+            capture.file.write((char *) header, sizeof(header));
+            capture.file.write((char *) values.data(), values.size()*sizeof(float));
+        }
+        return true;
+    }
+};
 
 static int run(const json & config) {
     const fs::path output = fs::weakly_canonical(config.at("output").get<std::string>());
@@ -86,6 +109,20 @@ static int run(const json & config) {
     env_flag("GGML_MOE_MMAP_ONLY", baseline == "mmap");
     env_flag("GGML_MOE_VERIFY_WEIGHTS", verify);
     env_flag("GGML_MOE_FORCE_GPU", config.value("gpu_experts", true));
+    const std::string prefetch = config.value("prefetch", "none");
+    const std::string history_bank = config.value("history_bank", "");
+    const std::string distance = std::to_string(config.value("prefetch_distance", 4));
+    const std::string count = std::to_string(config.value("prefetch_count", 4));
+    setenv("GGML_MOE_PREFETCH", prefetch.c_str(), 1);
+    setenv("GGML_MOE_HISTORY_BANK", history_bank.c_str(), 1);
+    setenv("GGML_MOE_PREFETCH_DISTANCE", distance.c_str(), 1);
+    setenv("GGML_MOE_PREFETCH_COUNT", count.c_str(), 1);
+    setenv("GGML_MOE_B_ADAPTER", config.value("b_adapter", "").c_str(), 1);
+    setenv("GGML_MOE_B_MARGIN", std::to_string(config.value("b_margin", 0.0)).c_str(), 1);
+
+    if (prefetch != "none" && prefetch[0] != 'b' && (baseline != "async" || history_bank.empty())) {
+        throw std::runtime_error("history prefetch requires async and a history bank");
+    }
 
     if (!diagnostic) {
         llama_log_set(quiet_log, nullptr);
@@ -98,7 +135,10 @@ static int run(const json & config) {
     mp.n_gpu_layers = config.value("gpu_layers", 99);
     mp.split_mode = LLAMA_SPLIT_MODE_NONE;
     mp.ssd_moe_offload = baseline != "resident";
-    mp.ssd_moe_cache_size = config.value("cache_mib", size_t(8192)) * 1024 * 1024;
+    const size_t cache_mib = config.value("cache_mib", size_t(8192));
+    const size_t reserve_mib = config.value("history_reserve_mib", size_t(0));
+    if (reserve_mib >= cache_mib) { throw std::runtime_error("history reserve exceeds cache budget"); }
+    mp.ssd_moe_cache_size = (cache_mib - reserve_mib) * 1024 * 1024;
     mp.ssd_moe_cache_workers = config.value("workers", 4u);
     mp.ssd_moe_stats = config.value("ssd_stats", false);
     mp.lazy_mode = mp.ssd_moe_offload ? LLAMA_LAZY_MODE_ON : LLAMA_LAZY_MODE_OFF;
@@ -118,12 +158,15 @@ static int run(const json & config) {
     json requests = read_json(config.at("input").get<std::string>()).at("requests");
     json frozen = json::array(), summaries = json::array();
     for (auto request : requests) {
+        ggml_backend_moe_prefetch_step(-1);
         const std::string id = request.at("id");
+        setenv("GGML_MOE_REQUEST_ID", id.c_str(), 1);
         if (id.empty() || id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != std::string::npos) {
             throw std::runtime_error("unsafe request id");
         }
         const fs::path dir = output / id;
         fs::create_directory(dir);
+        setenv("GGML_MOE_ROUTE_DUMP", config.value("save_routes", false) ? (dir / "routes.bin").c_str() : "", 1);
         std::cerr << "M0 request " << id << " baseline=" << baseline << " action=" << action << '\n';
         std::vector<llama_token> prompt, continuation;
         if (request.contains("prompt_tokens")) {
@@ -147,6 +190,8 @@ static int run(const json & config) {
                 if (token < 0 || token >= n_vocab) { throw std::runtime_error("token outside vocabulary"); }
             }
         }
+        feature_capture capture;
+        if (config.value("capture_features", false)) { capture.file.open(dir / "features.bin", std::ios::binary); }
         auto cp = llama_context_default_params();
         cp.n_ctx = prompt.size() + steps + 32;
         cp.n_batch = batch_size;
@@ -154,6 +199,7 @@ static int run(const json & config) {
         cp.n_threads = config.value("threads", 4);
         cp.n_threads_batch = cp.n_threads;
         cp.no_perf = false;
+        if (capture.file.is_open()) { cp.cb_eval = feature_capture::callback; cp.cb_eval_user_data = &capture; }
         std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(), cp), llama_free);
         if (!ctx) { throw std::runtime_error("context init failed"); }
         if (diagnostic && !ggml_backend_moe_trace_open((dir / "trace.jsonl").c_str(), id.c_str())) {
@@ -167,6 +213,8 @@ static int run(const json & config) {
         std::vector<llama_token> generated;
         int64_t eval = 0;
         auto decode = [&](llama_token * tokens, int count, int position) {
+            capture.step = position >= int(prompt.size()) ? position - int(prompt.size()) : -1;
+            ggml_backend_moe_prefetch_step(capture.step);
             ggml_backend_moe_trace_step(eval++, position, count);
             const auto start = clock_type::now();
             if (llama_decode(ctx.get(), llama_batch_get_one(tokens, count)) != 0) { throw std::runtime_error("decode failed"); }
@@ -211,6 +259,8 @@ static int run(const json & config) {
         if (getrusage(RUSAGE_SELF, &usage) == 0) { peak_rss_kib = usage.ru_maxrss; }
 #endif
         json summary = {{"id", id}, {"baseline", baseline}, {"action", action}, {"diagnostic", diagnostic},
+            {"prefetch", prefetch}, {"prefetch_distance", std::stoi(distance)}, {"prefetch_count", std::stoi(count)},
+            {"history_reserve_mib", reserve_mib}, {"expert_cache_mib", cache_mib - reserve_mib},
             {"verify_weights", verify}, {"prompt_tokens", prompt.size()}, {"generated_tokens", generated.size()},
             {"greedy_tokens", generated}, {"n_vocab", n_vocab}, {"layers", llama_model_n_layer(model.get())},
             {"prefill_ms", prefill_ms}, {"ttft_ms", ttft_ms}, {"decode_ms", decode_ms}, {"token_ms", token_ms}, {"wall_ms", wall_ms},

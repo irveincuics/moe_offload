@@ -332,6 +332,7 @@ extern "C" {
     // M0 diagnostics: one request/context per process. This mode synchronizes graph nodes.
     GGML_API bool ggml_backend_moe_trace_open(const char * path, const char * request);
     GGML_API void ggml_backend_moe_trace_step(int64_t eval, int64_t token, int64_t n_tokens);
+    GGML_API void ggml_backend_moe_prefetch_step(int64_t decode_step);
     GGML_API void ggml_backend_moe_trace_close(void);
     GGML_API bool ggml_backend_moe_trace_active(void);
     GGML_API void ggml_backend_moe_trace_cuda_event(const char * event, const char * tensor, size_t offset, size_t bytes, double elapsed_ms);

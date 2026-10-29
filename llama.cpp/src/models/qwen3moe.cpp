@@ -173,8 +173,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         cb(cur, "ffn_norm", il);
 
         const char * prefetch = getenv("GGML_MOE_PREFETCH");
-        if (prefetch && prefetch[0] == 'b' && cur->ne[1] == 1 &&
-                !(std::string(prefetch) == "bgu" && il + atoi(getenv("GGML_MOE_PREFETCH_DISTANCE")) >= n_layer)) {
+        const bool prefill_prefetch = prefetch && std::string(prefetch) == "bguf";
+        const bool bounded_prefetch = prefetch &&
+            (std::string(prefetch) == "bgu" || std::string(prefetch) == "bguf");
+        if (prefetch && prefetch[0] == 'b' && (cur->ne[1] == 1 || prefill_prefetch) &&
+                !(bounded_prefetch && il + atoi(getenv("GGML_MOE_PREFETCH_DISTANCE")) >= n_layer)) {
             const int distance = atoi(getenv("GGML_MOE_PREFETCH_DISTANCE"));
             const int target = (il + distance) % n_layer;
             auto * prediction = ggml_mul_mat(ctx0, model.layers[target].ffn_gate_inp, cur);

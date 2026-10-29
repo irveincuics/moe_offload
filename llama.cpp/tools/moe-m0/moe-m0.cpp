@@ -63,7 +63,8 @@ static void env_flag(const char * name, bool value) {
 static void quiet_log(enum ggml_log_level level, const char * text, void *) {
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR ||
             std::string(text).find("ssd_moe_cache: final_evals=") == 0 ||
-            std::string(text).find("moe_prefetch:") == 0) { fputs(text, stderr); }
+            std::string(text).find("moe_prefetch:") == 0 ||
+            std::string(text).find("moe_prefetch_prefill:") == 0) { fputs(text, stderr); }
 }
 
 struct feature_capture {
@@ -109,14 +110,20 @@ static int run(const json & config) {
     env_flag("GGML_MOE_MMAP_ONLY", baseline == "mmap");
     env_flag("GGML_MOE_VERIFY_WEIGHTS", verify);
     env_flag("GGML_MOE_FORCE_GPU", config.value("gpu_experts", true));
+    if (config.contains("pack")) { setenv("LLAMA_SSD_MOE_PACK", config.at("pack").get<std::string>().c_str(), 1); }
+    const std::string ssd_pack = getenv("LLAMA_SSD_MOE_PACK") ? getenv("LLAMA_SSD_MOE_PACK") : "";
     const std::string prefetch = config.value("prefetch", "none");
     const std::string history_bank = config.value("history_bank", "");
     const std::string distance = std::to_string(config.value("prefetch_distance", 4));
     const std::string count = std::to_string(config.value("prefetch_count", 4));
+    const std::string prefill_count = std::to_string(config.value("prefill_prefetch_count", 16));
+    const std::string prefill_slots = std::to_string(config.value("prefill_prefetch_slots", 64));
     setenv("GGML_MOE_PREFETCH", prefetch.c_str(), 1);
     setenv("GGML_MOE_HISTORY_BANK", history_bank.c_str(), 1);
     setenv("GGML_MOE_PREFETCH_DISTANCE", distance.c_str(), 1);
     setenv("GGML_MOE_PREFETCH_COUNT", count.c_str(), 1);
+    setenv("GGML_MOE_PREFILL_PREFETCH_COUNT", prefill_count.c_str(), 1);
+    setenv("GGML_MOE_PREFILL_PREFETCH_SLOTS", prefill_slots.c_str(), 1);
     setenv("GGML_MOE_B_ADAPTER", config.value("b_adapter", "").c_str(), 1);
     setenv("GGML_MOE_B_MARGIN", std::to_string(config.value("b_margin", 0.0)).c_str(), 1);
 
@@ -213,7 +220,7 @@ static int run(const json & config) {
         std::vector<llama_token> generated;
         int64_t eval = 0;
         auto decode = [&](llama_token * tokens, int count, int position) {
-            capture.step = position >= int(prompt.size()) ? position - int(prompt.size()) : -1;
+            capture.step = position >= int(prompt.size()) ? position - int(prompt.size()) : position - int(prompt.size()) - 1;
             ggml_backend_moe_prefetch_step(capture.step);
             ggml_backend_moe_trace_step(eval++, position, count);
             const auto start = clock_type::now();
@@ -260,7 +267,9 @@ static int run(const json & config) {
 #endif
         json summary = {{"id", id}, {"baseline", baseline}, {"action", action}, {"diagnostic", diagnostic},
             {"prefetch", prefetch}, {"prefetch_distance", std::stoi(distance)}, {"prefetch_count", std::stoi(count)},
+            {"prefill_prefetch_count", std::stoi(prefill_count)}, {"prefill_prefetch_slots", std::stoi(prefill_slots)},
             {"history_reserve_mib", reserve_mib}, {"expert_cache_mib", cache_mib - reserve_mib},
+            {"ssd_pack", ssd_pack},
             {"verify_weights", verify}, {"prompt_tokens", prompt.size()}, {"generated_tokens", generated.size()},
             {"greedy_tokens", generated}, {"n_vocab", n_vocab}, {"layers", llama_model_n_layer(model.get())},
             {"prefill_ms", prefill_ms}, {"ttft_ms", ttft_ms}, {"decode_ms", decode_ms}, {"token_ms", token_ms}, {"wall_ms", wall_ms},

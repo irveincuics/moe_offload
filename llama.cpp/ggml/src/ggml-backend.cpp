@@ -29,6 +29,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1007,6 +1008,7 @@ public:
         uint64_t                 slot = 0;
         ggml_backend_t           copy_backend = nullptr;
         bool                     prefetched = false;
+        bool                     prefill_prefetched = false;
         bool                     demanded = false;
         int64_t                  target_step = -1;
         int                      target_layer = -1;
@@ -1049,6 +1051,10 @@ public:
             prefetch_count = atoi(getenv("GGML_MOE_PREFETCH_COUNT"));
             prefetch_distance = atoi(getenv("GGML_MOE_PREFETCH_DISTANCE"));
             b_margin = atof(getenv("GGML_MOE_B_MARGIN"));
+            if (prefetch_mode == "bguf") {
+                prefill_prefetch_count = atoi(getenv("GGML_MOE_PREFILL_PREFETCH_COUNT"));
+                prefill_prefetch_slots = atoi(getenv("GGML_MOE_PREFILL_PREFETCH_SLOTS"));
+            }
         }
         if (const char * path = getenv("GGML_MOE_ROUTE_DUMP")) {
             if (path[0]) { route_dump.open(path, std::ios::binary); }
@@ -1059,7 +1065,9 @@ public:
     ~ggml_ssd_expert_cache() {
         for (const auto & value : entries) {
             value.second->ready.wait();
-            if (value.second->prefetched && !value.second->demanded) { ++pf_unused; }
+            if (value.second->prefetched && !value.second->demanded) {
+                if (value.second->prefill_prefetched) { ++pf_prefill_unused; } else { ++pf_unused; }
+            }
             if (value.second->copy_backend) { ggml_backend_synchronize(value.second->copy_backend); }
             moe_trace.emit("evict", value.first.tensor->name, value.first.expert, value.second->slot,
                     value.second->data.charged, "cache_destroy");
@@ -1072,6 +1080,14 @@ public:
                     " wait_us=%" PRIu64 " reclaim_us=%" PRIu64 " peak_bytes=%zu score_sync_us=%" PRIu64 " score_events=%" PRIu64 "\n",
                     prefetch_mode.c_str(), pf_demand, pf_miss, pf_natural, pf_issued, pf_ready, pf_late,
                     pf_unused, pf_skipped, pf_bytes, pf_predict_us, pf_wait_us, pf_reclaim_us, peak_bytes, pf_score_sync_us, pf_score_events);
+            GGML_LOG_INFO("moe_prefetch_prefill: mode=%s demand=%" PRIu64 " miss=%" PRIu64 " natural=%" PRIu64
+                    " issued=%" PRIu64 " ready=%" PRIu64 " late=%" PRIu64 " unused=%" PRIu64
+                    " skipped=%" PRIu64 " bytes=%" PRIu64 " predict_us=%" PRIu64
+                    " score_sync_us=%" PRIu64 " score_events=%" PRIu64 "\n",
+                    prefetch_mode.c_str(), pf_prefill_demand, pf_prefill_miss, pf_prefill_natural,
+                    pf_prefill_issued, pf_prefill_ready, pf_prefill_late, pf_prefill_unused,
+                    pf_prefill_skipped, pf_prefill_bytes, pf_prefill_predict_us,
+                    pf_prefill_score_sync_us, pf_prefill_score_events);
         }
     }
 
@@ -1127,10 +1143,11 @@ public:
         const bool packed = tensor_source.record_size != 0;
         int layer = -1;
         sscanf(tensor->name, "blk.%d.", &layer);
-        if (!speculative && packed && moe_prefetch_decode_step >= 0 &&
+        const bool track_prefill = prefetch_mode == "bguf" && moe_prefetch_decode_step < 0;
+        if (!speculative && packed && (moe_prefetch_decode_step >= 0 || track_prefill) &&
                 (last_demand_step != moe_prefetch_decode_step || last_demand_layer != layer)) {
             last_demand_step = moe_prefetch_decode_step; last_demand_layer = layer;
-            if (route_dump.is_open()) {
+            if (moe_prefetch_decode_step >= 0 && route_dump.is_open()) {
                 int32_t record[10] = {int32_t(moe_prefetch_decode_step), layer};
                 GGML_ASSERT(expert_ids.size() == 8);
                 std::copy(expert_ids.begin(), expert_ids.end(), record + 2);
@@ -1138,16 +1155,25 @@ public:
             }
 
             for (int32_t id : expert_ids) {
-                ++pf_demand;
+                if (track_prefill) { ++pf_prefill_demand; } else { ++pf_demand; }
                 const auto it = entries.find({cache_tensor, id});
-                if (it == entries.end()) { ++pf_miss; continue; }
+                if (it == entries.end()) {
+                    if (track_prefill) { ++pf_prefill_miss; } else { ++pf_miss; }
+                    continue;
+                }
                 auto & item = *it->second;
                 if (item.prefetched && !item.demanded) {
                     const bool ready = item.ready.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
-                    if (ready) { ++pf_ready; } else { ++pf_late; workers.promote(item.slot); }
+                    if (track_prefill) {
+                        if (ready) { ++pf_prefill_ready; } else { ++pf_prefill_late; workers.promote(item.slot); }
+                    } else {
+                        if (ready) { ++pf_ready; } else { ++pf_late; workers.promote(item.slot); }
+                    }
                     speculative_bytes -= item.data.charged;
                     item.demanded = true;
-                } else { ++pf_natural; }
+                } else {
+                    if (track_prefill) { ++pf_prefill_natural; } else { ++pf_natural; }
+                }
             }
         }
         if (packed && (tensor_source.slice_offset > tensor_source.record_size ||
@@ -1185,7 +1211,7 @@ public:
                         continue;
                     }
                     const auto & item = *it->second;
-                    if ((prefetch_mode == "bgp" || prefetch_mode == "bgu") && item.prefetched && !item.demanded &&
+                    if ((prefetch_mode == "bgp" || prefetch_mode == "bgu" || prefetch_mode == "bguf") && item.prefetched && !item.demanded &&
                             (item.target_step > moe_prefetch_decode_step ||
                              (item.target_step == moe_prefetch_decode_step && item.target_layer >= layer))) {
                         continue;
@@ -1211,7 +1237,8 @@ public:
                         victim->second->slot, victim->second->data.charged);
                 resident_bytes -= victim->second->data.charged;
                 if (victim->second->prefetched && !victim->second->demanded) {
-                    speculative_bytes -= victim->second->data.charged; ++pf_unused;
+                    speculative_bytes -= victim->second->data.charged;
+                    if (victim->second->prefill_prefetched) { ++pf_prefill_unused; } else { ++pf_unused; }
                 }
                 entries.erase(victim);
                 n_evictions++;
@@ -1241,11 +1268,14 @@ public:
             item->data.resize(read_size, alignment);
             item->last_use = speculative ? 0 : ++clock;
             item->prefetched = speculative;
+            item->prefill_prefetched = speculative && moe_prefetch_decode_step < 0;
             item->slot = ++slot_clock;
             resident_bytes += item->data.charged;
             peak_bytes = std::max(peak_bytes, resident_bytes);
             if (speculative) {
-                speculative_bytes += item->data.charged; ++pf_issued; pf_bytes += read_size;
+                speculative_bytes += item->data.charged;
+                if (item->prefill_prefetched) { ++pf_prefill_issued; pf_prefill_bytes += read_size; }
+                else { ++pf_issued; pf_bytes += read_size; }
             }
             const uint8_t * fallback = packed ? nullptr : (const uint8_t *) cache_tensor->data + (size_t) id * expert_size;
             moe_trace.emit("reserve", ggml_get_name(cache_tensor), id, item->slot, item->data.charged, packed ? "packed_record" : "aligned_slice");
@@ -1337,28 +1367,39 @@ public:
                     (item.target_step < moe_prefetch_decode_step ||
                      (item.target_step == moe_prefetch_decode_step && item.target_layer <= layer)) &&
                     item.ready.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-                resident_bytes -= item.data.charged; speculative_bytes -= item.data.charged; ++pf_unused;
+                resident_bytes -= item.data.charged; speculative_bytes -= item.data.charged;
+                if (item.prefill_prefetched) { ++pf_prefill_unused; } else { ++pf_unused; }
                 moe_trace.emit("evict", it->first.tensor->name, it->first.expert, item.slot, item.data.charged, "prediction_expired");
                 it = entries.erase(it);
             } else { ++it; }
         }
     }
 
-    void submit_predictions(int target_layer, int64_t target_step, const std::vector<int> & ranked, ggml_backend_t backend) {
+    void submit_predictions(int target_layer, int64_t target_step, const std::vector<int> & ranked,
+            ggml_backend_t backend, int count = -1, int slot_limit = -1, bool prefill = false) {
         const auto target = layer_sources.find(target_layer);
         if (target == layer_sources.end()) { return; }
         const auto & source = sources.at(target->second);
         const size_t charged = source.record_size + source.file->alignment - 1;
         const size_t reserve = 16 * charged;
-        const size_t limit = std::min<size_t>((prefetch_mode.compare(0, 2, "bg") == 0 ? 4 * charged : 128 * 1024 * 1024), capacity > reserve ? capacity - reserve : 0);
+        const int max_count = count >= 0 ? count : prefetch_count;
+        const int max_slots = slot_limit >= 0 ? slot_limit : 4;
+        const size_t mode_limit = prefetch_mode.compare(0, 2, "bg") == 0 ? max_slots * charged : 128 * 1024 * 1024;
+        const size_t limit = std::min<size_t>(mode_limit, capacity > reserve ? capacity - reserve : 0);
         int submitted = 0;
         for (int id : ranked) {
             if (entries.count({source.group, id})) { continue; }
-            if (submitted >= prefetch_count) { break; }
-            if (charged > limit || speculative_bytes > limit - charged) { ++pf_skipped; break; }
+            if (submitted >= max_count) { break; }
+            if (charged > limit || speculative_bytes > limit - charged) {
+                if (prefill) { ++pf_prefill_skipped; } else { ++pf_skipped; }
+                break;
+            }
             const size_t expert_size = ggml_nbytes(source.tensor) / source.tensor->ne[2];
             const auto fetched = acquire(source.tensor, {id}, source.tensor->ne[2], expert_size, backend, true);
-            if (fetched.empty()) { ++pf_skipped; break; }
+            if (fetched.empty()) {
+                if (prefill) { ++pf_prefill_skipped; } else { ++pf_skipped; }
+                break;
+            }
             fetched[0].block->target_step = target_step;
             fetched[0].block->target_layer = target_layer;
             ++submitted;
@@ -1369,29 +1410,64 @@ public:
     bool prefetch_mode_is_b() const { return prefetch_mode[0] == 'b'; }
 
     bool needs_score(const ggml_tensor * tensor) const {
-        return prefetch_mode[0] == 'b' && moe_prefetch_decode_step >= 0 &&
+        const bool active_step = moe_prefetch_decode_step >= 0 ||
+            (prefetch_mode == "bguf" && moe_prefetch_decode_step < 0);
+        return prefetch_mode[0] == 'b' && active_step &&
             strncmp(tensor->name, "moe_prefetch_score-", 19) == 0;
     }
 
     void consume_score(ggml_tensor * tensor, ggml_backend_t backend, uint64_t sync_us) {
         int layer = -1;
         sscanf(tensor->name, "moe_prefetch_score-%d", &layer);
-        std::vector<float> values(tensor->ne[0]);
+        const bool prefill = moe_prefetch_decode_step < 0;
+        std::vector<float> values(ggml_nelements(tensor));
         ggml_backend_tensor_get(tensor, values.data(), 0, values.size()*sizeof(float));
-        pf_score_sync_us += sync_us; ++pf_score_events;
+        if (prefill) { pf_prefill_score_sync_us += sync_us; ++pf_prefill_score_events; }
+        else { pf_score_sync_us += sync_us; ++pf_score_events; }
         const auto begin = std::chrono::steady_clock::now();
         expire_predictions(layer - 1);
-        std::vector<int> ranked(values.size());
-        for (size_t i = 0; i < ranked.size(); ++i) { ranked[i] = i; }
-        std::sort(ranked.begin(), ranked.end(), [&](int a, int b) { return values[a] != values[b] ? values[a] > values[b] : a < b; });
-        if (prefetch_mode.compare(0, 2, "bg") == 0) {
-            const float boundary = values[ranked[7]];
-            ranked.resize(8);
-            ranked.erase(std::remove_if(ranked.begin(), ranked.end(), [&](int id) { return values[id] - boundary < b_margin; }), ranked.end());
+        std::vector<int> ranked(tensor->ne[0]);
+        if (prefill) {
+            std::vector<int> support(tensor->ne[0], 0);
+            std::vector<double> margin(tensor->ne[0], 0);
+            std::vector<int> token_rank(tensor->ne[0]);
+            for (int64_t token = 0; token < tensor->ne[1]; ++token) {
+                std::iota(token_rank.begin(), token_rank.end(), 0);
+                const float * scores = values.data() + token * tensor->ne[0];
+                std::partial_sort(token_rank.begin(), token_rank.begin() + 8, token_rank.end(),
+                        [&](int a, int b) { return scores[a] != scores[b] ? scores[a] > scores[b] : a < b; });
+                const float boundary = scores[token_rank[7]];
+                for (int top = 0; top < 8; ++top) {
+                    const int id = token_rank[top];
+                    if (scores[id] - boundary >= b_margin) {
+                        ++support[id];
+                        margin[id] += scores[id] - boundary;
+                    }
+                }
+            }
+            std::iota(ranked.begin(), ranked.end(), 0);
+            std::sort(ranked.begin(), ranked.end(), [&](int a, int b) {
+                if (support[a] != support[b]) { return support[a] > support[b]; }
+                if (margin[a] != margin[b]) { return margin[a] > margin[b]; }
+                return a < b;
+            });
+            ranked.erase(std::find_if(ranked.begin(), ranked.end(), [&](int id) { return support[id] == 0; }), ranked.end());
+        } else {
+            std::iota(ranked.begin(), ranked.end(), 0);
+            std::sort(ranked.begin(), ranked.end(), [&](int a, int b) { return values[a] != values[b] ? values[a] > values[b] : a < b; });
+            if (prefetch_mode.compare(0, 2, "bg") == 0) {
+                const float boundary = values[ranked[7]];
+                ranked.resize(8);
+                ranked.erase(std::remove_if(ranked.begin(), ranked.end(), [&](int id) { return values[id] - boundary < b_margin; }), ranked.end());
+            }
         }
-        pf_predict_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+        const uint64_t predict_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - begin).count();
+        if (prefill) { pf_prefill_predict_us += predict_us; } else { pf_predict_us += predict_us; }
         submit_predictions((layer + prefetch_distance) % 48,
-                moe_prefetch_decode_step + (layer + prefetch_distance >= 48), ranked, backend);
+                moe_prefetch_decode_step + (layer + prefetch_distance >= 48), ranked, backend,
+                prefill ? prefill_prefetch_count : prefetch_count,
+                prefill ? prefill_prefetch_slots : 4, prefill);
     }
 
     bool wait_ready(const std::shared_ptr<entry> & item) {
@@ -1475,6 +1551,7 @@ private:
     std::string prefetch_mode = "none";
     std::ofstream route_dump;
     int prefetch_count = 4, prefetch_distance = 4;
+    int prefill_prefetch_count = 16, prefill_prefetch_slots = 64;
     double b_margin = 0;
     uint64_t pf_score_sync_us = 0, pf_score_events = 0;
     std::shared_ptr<const moe_history::bank> history_bank;
@@ -1486,6 +1563,10 @@ private:
     int last_demand_layer = -1, last_predict_layer = -1;
     uint64_t pf_demand = 0, pf_miss = 0, pf_natural = 0, pf_issued = 0, pf_ready = 0, pf_late = 0;
     uint64_t pf_unused = 0, pf_skipped = 0, pf_bytes = 0, pf_predict_us = 0, pf_wait_us = 0, pf_reclaim_us = 0;
+    uint64_t pf_prefill_demand = 0, pf_prefill_miss = 0, pf_prefill_natural = 0;
+    uint64_t pf_prefill_issued = 0, pf_prefill_ready = 0, pf_prefill_late = 0, pf_prefill_unused = 0;
+    uint64_t pf_prefill_skipped = 0, pf_prefill_bytes = 0, pf_prefill_predict_us = 0;
+    uint64_t pf_prefill_score_sync_us = 0, pf_prefill_score_events = 0;
     std::unordered_map<std::string, std::shared_ptr<ggml_ssd_source_file>> files;
     std::unordered_map<const ggml_tensor *, source> sources;
     std::unordered_map<std::string, source> sources_by_name;

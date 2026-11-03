@@ -35,6 +35,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #include "ggml-moe-trace.h"
 #include "ggml-moe-history.h"
@@ -1026,7 +1029,7 @@ public:
         async_demand = getenv("GGML_MOE_ASYNC_DEMAND") && atoi(getenv("GGML_MOE_ASYNC_DEMAND")) == 1;
         verify_weights = getenv("GGML_MOE_VERIFY_WEIGHTS") && atoi(getenv("GGML_MOE_VERIFY_WEIGHTS")) == 1;
         if (const char * mode = getenv("GGML_MOE_PREFETCH")) { prefetch_mode = mode; }
-        if (prefetch_mode != "none" && prefetch_mode[0] != 'b' && prefetch_mode != "oracle") {
+        if (prefetch_mode != "none" && prefetch_mode[0] != 'b' && prefetch_mode != "oracle" && prefetch_mode != "cpu" && prefetch_mode != "cpu_history") {
             const char * filename = getenv("GGML_MOE_HISTORY_BANK");
             if (!filename) { GGML_ABORT("prefetch requires GGML_MOE_HISTORY_BANK"); }
             history_bank = std::make_shared<moe_history::bank>(filename);
@@ -1056,6 +1059,24 @@ public:
                 prefill_prefetch_slots = atoi(getenv("GGML_MOE_PREFILL_PREFETCH_SLOTS"));
             }
         }
+        if (prefetch_mode == "cpu" || prefetch_mode == "cpu_history") {
+            prefetch_count = atoi(getenv("GGML_MOE_PREFETCH_COUNT"));
+            prefetch_distance = atoi(getenv("GGML_MOE_PREFETCH_DISTANCE"));
+            prefill_prefetch_count = atoi(getenv("GGML_MOE_PREFILL_PREFETCH_COUNT"));
+            prefill_prefetch_slots = atoi(getenv("GGML_MOE_PREFILL_PREFETCH_SLOTS"));
+            cpu_decode_prefetch_slots = atoi(getenv("GGML_MOE_CPU_DECODE_PREFETCH_SLOTS"));
+            cpu_decode_temporal_weight = atof(getenv("GGML_MOE_CPU_DECODE_TEMPORAL_WEIGHT"));
+            b_margin = atof(getenv("GGML_MOE_B_MARGIN"));
+        }
+        if (prefetch_mode == "cpu") {
+            cpu_async = atoi(getenv("GGML_MOE_CPU_ASYNC")) != 0;
+            cpu_predict_workers.reset(new ggml_ssd_worker_pool(1));
+        }
+        if (prefetch_mode == "cpu_history") {
+            cpu_transition.assign(128 * 128, 0);
+            cpu_transition_total.assign(128, 1);
+            for (int expert = 0; expert < 128; ++expert) { cpu_transition[expert * 128 + expert] = 1; }
+        }
         if (const char * path = getenv("GGML_MOE_ROUTE_DUMP")) {
             if (path[0]) { route_dump.open(path, std::ios::binary); }
         }
@@ -1063,6 +1084,7 @@ public:
     }
 
     ~ggml_ssd_expert_cache() {
+        cpu_predict_workers.reset();
         for (const auto & value : entries) {
             value.second->ready.wait();
             if (value.second->prefetched && !value.second->demanded) {
@@ -1073,6 +1095,12 @@ public:
                     value.second->data.charged, "cache_destroy");
         }
         if (stats_enabled) {
+            if (prefetch_mode == "cpu") {
+                GGML_LOG_INFO("moe_prefetch_cpu: async=%d jobs=%" PRIu64 " expired=%" PRIu64
+                        " pending=%zu router_bytes=%zu router_load_us=%" PRIu64 " snapshot_us=%" PRIu64
+                        " compute_us=%" PRIu64 "\n", cpu_async, cpu_jobs, cpu_expired,
+                        cpu_pending.size(), cpu_router_bytes, cpu_router_load_us, cpu_snapshot_us, cpu_compute_us.load());
+            }
             report(true);
             GGML_LOG_INFO("moe_prefetch: mode=%s demand=%" PRIu64 " miss=%" PRIu64 " natural=%" PRIu64
                     " issued=%" PRIu64 " ready=%" PRIu64 " late=%" PRIu64 " unused=%" PRIu64
@@ -1143,7 +1171,8 @@ public:
         const bool packed = tensor_source.record_size != 0;
         int layer = -1;
         sscanf(tensor->name, "blk.%d.", &layer);
-        const bool track_prefill = prefetch_mode == "bguf" && moe_prefetch_decode_step < 0;
+        if (!speculative && packed && prefetch_mode == "cpu") { poll_cpu_predictions(layer, backend); }
+        const bool track_prefill = (prefetch_mode == "bguf" || prefetch_mode == "cpu" || prefetch_mode == "cpu_history") && moe_prefetch_decode_step < 0;
         if (!speculative && packed && (moe_prefetch_decode_step >= 0 || track_prefill) &&
                 (last_demand_step != moe_prefetch_decode_step || last_demand_layer != layer)) {
             last_demand_step = moe_prefetch_decode_step; last_demand_layer = layer;
@@ -1211,7 +1240,7 @@ public:
                         continue;
                     }
                     const auto & item = *it->second;
-                    if ((prefetch_mode == "bgp" || prefetch_mode == "bgu" || prefetch_mode == "bguf") && item.prefetched && !item.demanded &&
+                    if ((prefetch_mode == "bgp" || prefetch_mode == "bgu" || prefetch_mode == "bguf" || prefetch_mode == "cpu" || prefetch_mode == "cpu_history") && item.prefetched && !item.demanded &&
                             (item.target_step > moe_prefetch_decode_step ||
                              (item.target_step == moe_prefetch_decode_step && item.target_layer >= layer))) {
                         continue;
@@ -1332,7 +1361,89 @@ public:
         return result;
     }
 
-    void prefetch_after_demand(const ggml_tensor * tensor, const std::vector<int32_t> & ids, ggml_backend_t backend) {
+    void prefetch_after_demand(const ggml_tensor * tensor, const std::vector<int32_t> & ids,
+            const std::vector<int32_t> & token_ids, int64_t n_tokens, int64_t top_k, ggml_backend_t backend) {
+        if (prefetch_mode == "cpu_history") {
+            if (!is_packed(tensor)) { return; }
+            int layer = -1;
+            if (sscanf(tensor->name, "blk.%d.", &layer) != 1 ||
+                    (last_predict_step == moe_prefetch_decode_step && last_predict_layer == layer)) { return; }
+            last_predict_step = moe_prefetch_decode_step; last_predict_layer = layer;
+            expire_predictions(layer);
+            const auto begin = std::chrono::steady_clock::now();
+            if (cpu_route_step != moe_prefetch_decode_step) {
+                if (!cpu_routes.empty()) {
+                    cpu_previous_route = cpu_routes.back();
+                }
+                cpu_route_step = moe_prefetch_decode_step;
+                cpu_routes.assign(n_tokens, moe_history::path(48));
+            }
+            for (int64_t token = 0; token < n_tokens; ++token) {
+                for (int64_t k = 0; k < top_k; ++k) { cpu_routes[token][layer].add(token_ids[token * top_k + k]); }
+            }
+            if (layer >= prefetch_distance) {
+                for (int64_t token = 0; token < n_tokens; ++token) {
+                    const auto & source = cpu_routes[token][layer - prefetch_distance];
+                    const auto & target = cpu_routes[token][layer];
+                    for (int source_id = 0; source_id < 128; ++source_id) {
+                        if (!source.has(source_id)) { continue; }
+                        for (int target_id = 0; target_id < 128; ++target_id) {
+                            if (target.has(target_id)) {
+                                ++cpu_transition[source_id * 128 + target_id];
+                                ++cpu_transition_total[source_id];
+                            }
+                        }
+                    }
+                }
+            }
+            if (layer + prefetch_distance >= 48) { return; }
+            std::vector<int> support(128, 0);
+            std::vector<double> confidence(128, 0);
+            std::vector<int> token_rank(128);
+            std::vector<double> token_score(128);
+            for (int64_t token = 0; token < n_tokens; ++token) {
+                std::fill(token_score.begin(), token_score.end(), 0);
+                const auto & route = cpu_routes[token][layer];
+                for (int source_id = 0; source_id < 128; ++source_id) {
+                    if (!route.has(source_id)) { continue; }
+                    for (int target_id = 0; target_id < 128; ++target_id) {
+                        token_score[target_id] += cpu_transition[source_id * 128 + target_id] /
+                            cpu_transition_total[source_id];
+                    }
+                }
+                if (moe_prefetch_decode_step >= 0) {
+                    const auto & previous = cpu_previous_route[layer + prefetch_distance];
+                    for (int target_id = 0; target_id < 128; ++target_id) {
+                        if (previous.has(target_id)) { token_score[target_id] += cpu_decode_temporal_weight; }
+                    }
+                }
+                std::iota(token_rank.begin(), token_rank.end(), 0);
+                std::partial_sort(token_rank.begin(), token_rank.begin() + 8, token_rank.end(), [&](int a, int b) {
+                    return token_score[a] != token_score[b] ? token_score[a] > token_score[b] : a < b;
+                });
+                for (int top = 0; top < 8 && token_score[token_rank[top]] > 0; ++top) {
+                    const int id = token_rank[top];
+                    ++support[id];
+                    confidence[id] += token_score[id];
+                }
+            }
+            std::vector<int> ranked(128);
+            std::iota(ranked.begin(), ranked.end(), 0);
+            std::sort(ranked.begin(), ranked.end(), [&](int a, int b) {
+                if (support[a] != support[b]) { return support[a] > support[b]; }
+                if (confidence[a] != confidence[b]) { return confidence[a] > confidence[b]; }
+                return a < b;
+            });
+            ranked.erase(std::find_if(ranked.begin(), ranked.end(), [&](int id) { return support[id] == 0; }), ranked.end());
+            const bool prefill = moe_prefetch_decode_step < 0;
+            const uint64_t predict_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - begin).count();
+            if (prefill) { pf_prefill_predict_us += predict_us; } else { pf_predict_us += predict_us; }
+            submit_predictions(layer + prefetch_distance, moe_prefetch_decode_step, ranked, backend,
+                    prefill ? prefill_prefetch_count : prefetch_count,
+                    prefill ? prefill_prefetch_slots : cpu_decode_prefetch_slots, prefill);
+            return;
+        }
         if ((!predictor && !oracle_request) || moe_prefetch_decode_step < 0 || !is_packed(tensor)) { return; }
         int layer = -1;
         if (sscanf(tensor->name, "blk.%d.", &layer) != 1 ||
@@ -1384,7 +1495,7 @@ public:
         const size_t reserve = 16 * charged;
         const int max_count = count >= 0 ? count : prefetch_count;
         const int max_slots = slot_limit >= 0 ? slot_limit : 4;
-        const size_t mode_limit = prefetch_mode.compare(0, 2, "bg") == 0 ? max_slots * charged : 128 * 1024 * 1024;
+        const size_t mode_limit = prefetch_mode == "cpu" || prefetch_mode == "cpu_history" || prefetch_mode.compare(0, 2, "bg") == 0 ? max_slots * charged : 128 * 1024 * 1024;
         const size_t limit = std::min<size_t>(mode_limit, capacity > reserve ? capacity - reserve : 0);
         int submitted = 0;
         for (int id : ranked) {
@@ -1407,9 +1518,113 @@ public:
         }
     }
 
-    bool prefetch_mode_is_b() const { return prefetch_mode[0] == 'b'; }
+    bool needs_prediction_callback() const { return prefetch_mode[0] == 'b' || prefetch_mode == "cpu"; }
+
+    void prepare_cpu_routers(const ggml_cgraph & graph) {
+        if (prefetch_mode != "cpu" || !cpu_routers.empty()) { return; }
+        const auto begin = std::chrono::steady_clock::now();
+        for (int i = 0; i < graph.n_leafs; ++i) {
+            const auto * tensor = graph.leafs[i];
+            int layer = -1, end = 0;
+            sscanf(tensor->name, "blk.%d.ffn_gate_inp.weight%n", &layer, &end);
+            if (!end || tensor->name[end] || layer < prefetch_distance) { continue; }
+            auto & weights = cpu_routers[layer];
+            weights.resize(ggml_nelements(tensor));
+            GGML_ASSERT(ggml_is_contiguous(tensor));
+            if (tensor->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(tensor, weights.data(), 0, ggml_nbytes(tensor));
+            } else {
+                std::vector<uint8_t> raw(ggml_nbytes(tensor));
+                ggml_backend_tensor_get(tensor, raw.data(), 0, raw.size());
+                ggml_get_type_traits(tensor->type)->to_float(raw.data(), weights.data(), weights.size());
+            }
+            cpu_router_bytes += weights.size() * sizeof(float);
+        }
+        GGML_ASSERT(cpu_routers.size() == size_t(48 - prefetch_distance));
+        cpu_router_load_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - begin).count();
+    }
+
+    static float cpu_router_dot(const float * w, const float * h, int64_t n) {
+        float sum = 0;
+        int64_t i = 0;
+#if defined(__aarch64__)
+        float32x4_t a = vdupq_n_f32(0), b = a, c = a, d = a;
+        for (; i + 15 < n; i += 16) {
+            a = vfmaq_f32(a, vld1q_f32(w+i), vld1q_f32(h+i));
+            b = vfmaq_f32(b, vld1q_f32(w+i+4), vld1q_f32(h+i+4));
+            c = vfmaq_f32(c, vld1q_f32(w+i+8), vld1q_f32(h+i+8));
+            d = vfmaq_f32(d, vld1q_f32(w+i+12), vld1q_f32(h+i+12));
+        }
+        sum = vaddvq_f32(vaddq_f32(vaddq_f32(a, b), vaddq_f32(c, d)));
+#endif
+        for (; i < n; ++i) { sum += w[i] * h[i]; }
+        return sum;
+    }
+
+    void poll_cpu_predictions(int current_layer, ggml_backend_t backend) {
+        while (!cpu_pending.empty()) {
+            auto job = cpu_pending.front();
+            if (job->done.wait_for(std::chrono::seconds(0)) != std::future_status::ready) { break; }
+            job->done.get();
+            cpu_pending.pop_front();
+            if (job->step != moe_prefetch_decode_step || job->layer + prefetch_distance <= current_layer) {
+                ++cpu_expired;
+                continue;
+            }
+            consume_values(job->layer, job->tokens, 128, job->values, backend);
+        }
+    }
+
+    void consume_hidden(ggml_tensor * tensor, ggml_backend_t backend, uint64_t sync_us) {
+        int layer = -1;
+        sscanf(tensor->name, "ffn_norm-%d", &layer);
+        poll_cpu_predictions(layer, backend);
+        expire_predictions(layer - 1);
+        const bool prefill = moe_prefetch_decode_step < 0;
+        if (prefill) { pf_prefill_score_sync_us += sync_us; ++pf_prefill_score_events; }
+        else { pf_score_sync_us += sync_us; ++pf_score_events; }
+        // At most one lookahead window can occupy snapshots and CPU queue entries.
+        if (cpu_pending.size() >= size_t(prefetch_distance)) { ++cpu_expired; return; }
+        GGML_ASSERT(tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor));
+        const auto begin = std::chrono::steady_clock::now();
+        auto job = std::make_shared<cpu_prediction>();
+        job->layer = layer; job->step = moe_prefetch_decode_step; job->tokens = tensor->ne[1];
+        job->hidden.resize(ggml_nelements(tensor));
+        job->values.resize(128 * job->tokens);
+        ggml_backend_tensor_get(tensor, job->hidden.data(), 0, ggml_nbytes(tensor));
+        cpu_snapshot_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - begin).count();
+        const auto * weights = &cpu_routers.at(layer + prefetch_distance);
+        const int64_t width = tensor->ne[0];
+        auto * result = job.get();
+        ++cpu_jobs;
+        job->done = cpu_predict_workers->submit([this, result, weights, width] {
+            const auto start = std::chrono::steady_clock::now();
+            for (int64_t t = 0; t < result->tokens; ++t) {
+                for (int e = 0; e < 128; ++e) {
+                    result->values[t * 128 + e] = cpu_router_dot(weights->data() + e * width,
+                            result->hidden.data() + t * width, width);
+                }
+            }
+            cpu_compute_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+            return true;
+        });
+        if (cpu_async) { cpu_pending.push_back(job); }
+        else {
+            job->done.get();
+            consume_values(layer, job->tokens, 128, job->values, backend);
+        }
+    }
 
     bool needs_score(const ggml_tensor * tensor) const {
+        if (prefetch_mode == "cpu") {
+            int layer = -1, end = 0;
+            return (moe_prefetch_decode_step < 0 ? prefill_prefetch_count : prefetch_count) > 0 &&
+                sscanf(tensor->name, "ffn_norm-%d%n", &layer, &end) == 1 && !tensor->name[end] &&
+                layer + prefetch_distance < 48;
+        }
         const bool active_step = moe_prefetch_decode_step >= 0 ||
             (prefetch_mode == "bguf" && moe_prefetch_decode_step < 0);
         return prefetch_mode[0] == 'b' && active_step &&
@@ -1417,6 +1632,7 @@ public:
     }
 
     void consume_score(ggml_tensor * tensor, ggml_backend_t backend, uint64_t sync_us) {
+        if (prefetch_mode == "cpu") { consume_hidden(tensor, backend, sync_us); return; }
         int layer = -1;
         sscanf(tensor->name, "moe_prefetch_score-%d", &layer);
         const bool prefill = moe_prefetch_decode_step < 0;
@@ -1424,16 +1640,22 @@ public:
         ggml_backend_tensor_get(tensor, values.data(), 0, values.size()*sizeof(float));
         if (prefill) { pf_prefill_score_sync_us += sync_us; ++pf_prefill_score_events; }
         else { pf_score_sync_us += sync_us; ++pf_score_events; }
+        consume_values(layer, tensor->ne[1], tensor->ne[0], values, backend);
+    }
+
+    void consume_values(int layer, int64_t tokens, int64_t experts, const std::vector<float> & values,
+            ggml_backend_t backend) {
+        const bool prefill = moe_prefetch_decode_step < 0;
         const auto begin = std::chrono::steady_clock::now();
         expire_predictions(layer - 1);
-        std::vector<int> ranked(tensor->ne[0]);
+        std::vector<int> ranked(experts);
         if (prefill) {
-            std::vector<int> support(tensor->ne[0], 0);
-            std::vector<double> margin(tensor->ne[0], 0);
-            std::vector<int> token_rank(tensor->ne[0]);
-            for (int64_t token = 0; token < tensor->ne[1]; ++token) {
+            std::vector<int> support(experts, 0);
+            std::vector<double> margin(experts, 0);
+            std::vector<int> token_rank(experts);
+            for (int64_t token = 0; token < tokens; ++token) {
                 std::iota(token_rank.begin(), token_rank.end(), 0);
-                const float * scores = values.data() + token * tensor->ne[0];
+                const float * scores = values.data() + token * experts;
                 std::partial_sort(token_rank.begin(), token_rank.begin() + 8, token_rank.end(),
                         [&](int a, int b) { return scores[a] != scores[b] ? scores[a] > scores[b] : a < b; });
                 const float boundary = scores[token_rank[7]];
@@ -1455,7 +1677,7 @@ public:
         } else {
             std::iota(ranked.begin(), ranked.end(), 0);
             std::sort(ranked.begin(), ranked.end(), [&](int a, int b) { return values[a] != values[b] ? values[a] > values[b] : a < b; });
-            if (prefetch_mode.compare(0, 2, "bg") == 0) {
+            if (prefetch_mode.compare(0, 2, "bg") == 0 || prefetch_mode == "cpu") {
                 const float boundary = values[ranked[7]];
                 ranked.resize(8);
                 ranked.erase(std::remove_if(ranked.begin(), ranked.end(), [&](int id) { return values[id] - boundary < b_margin; }), ranked.end());
@@ -1467,7 +1689,7 @@ public:
         submit_predictions((layer + prefetch_distance) % 48,
                 moe_prefetch_decode_step + (layer + prefetch_distance >= 48), ranked, backend,
                 prefill ? prefill_prefetch_count : prefetch_count,
-                prefill ? prefill_prefetch_slots : 4, prefill);
+                prefill ? prefill_prefetch_slots : (prefetch_mode == "cpu" ? cpu_decode_prefetch_slots : 4), prefill);
     }
 
     bool wait_ready(const std::shared_ptr<entry> & item) {
@@ -1552,6 +1774,8 @@ private:
     std::ofstream route_dump;
     int prefetch_count = 4, prefetch_distance = 4;
     int prefill_prefetch_count = 16, prefill_prefetch_slots = 64;
+    int cpu_decode_prefetch_slots = 4;
+    double cpu_decode_temporal_weight = 1;
     double b_margin = 0;
     uint64_t pf_score_sync_us = 0, pf_score_events = 0;
     std::shared_ptr<const moe_history::bank> history_bank;
@@ -1561,6 +1785,23 @@ private:
     size_t speculative_bytes = 0, peak_bytes = 0;
     int64_t last_demand_step = -2, last_predict_step = -2;
     int last_demand_layer = -1, last_predict_layer = -1;
+    int64_t cpu_route_step = -2;
+    std::vector<moe_history::path> cpu_routes;
+    moe_history::path cpu_previous_route = moe_history::path(48);
+    std::vector<double> cpu_transition, cpu_transition_total;
+    struct cpu_prediction {
+        int layer;
+        int64_t step, tokens;
+        std::vector<float> hidden, values;
+        std::shared_future<bool> done;
+    };
+    bool cpu_async = true;
+    std::unordered_map<int, std::vector<float>> cpu_routers;
+    std::deque<std::shared_ptr<cpu_prediction>> cpu_pending;
+    size_t cpu_router_bytes = 0;
+    uint64_t cpu_router_load_us = 0, cpu_snapshot_us = 0, cpu_jobs = 0, cpu_expired = 0;
+    std::atomic<uint64_t> cpu_compute_us{0};
+    std::unique_ptr<ggml_ssd_worker_pool> cpu_predict_workers;
     uint64_t pf_demand = 0, pf_miss = 0, pf_natural = 0, pf_issued = 0, pf_ready = 0, pf_late = 0;
     uint64_t pf_unused = 0, pf_skipped = 0, pf_bytes = 0, pf_predict_us = 0, pf_wait_us = 0, pf_reclaim_us = 0;
     uint64_t pf_prefill_demand = 0, pf_prefill_miss = 0, pf_prefill_natural = 0;
@@ -2469,10 +2710,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    if (sched->ssd_cache) { sched->ssd_cache->prepare_cpu_routers(sched->graph); }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
+    std::vector<int32_t> token_ids;
     std::vector<ggml_bitset_t> used_ids;
+    int64_t route_tokens = 0, route_top_k = 0;
 
     int prev_backend_id = -1;
 
@@ -2549,11 +2793,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // find the used experts
                         used_ids.clear();
                         used_ids.resize(ggml_bitset_size(n_expert));
+                        token_ids.clear();
+                        token_ids.reserve(ids_tensor->ne[0] * ids_tensor->ne[1]);
+                        route_tokens = ids_tensor->ne[1];
+                        route_top_k = ids_tensor->ne[0];
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
                                 GGML_ASSERT(id >= 0 && id < n_expert);
                                 ggml_bitset_set(used_ids.data(), id);
+                                token_ids.push_back(id);
                             }
                         }
 
@@ -2604,7 +2853,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                                 cached[i].size, ggml_backend_name(split_backend));
                                     }
                                     sched->ssd_cache->add_zero_copy(saved_bytes, pointers.size() * sizeof(void *));
-                                    sched->ssd_cache->prefetch_after_demand(input, selected_ids, split_backend);
+                                    sched->ssd_cache->prefetch_after_demand(input, selected_ids,
+                                            token_ids, route_tokens, route_top_k, split_backend);
                                     continue;
                                 }
                                 sched->ssd_cache->add_zero_copy_fallback();
@@ -2640,7 +2890,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 }
                                 sched->ssd_cache->add_backend_copy(cached[i].size);
                             }
-                            sched->ssd_cache->prefetch_after_demand(input, selected_ids, split_backend);
+                            sched->ssd_cache->prefetch_after_demand(input, selected_ids,
+                                    token_ids, route_tokens, route_top_k, split_backend);
                             continue;
                         }
                         if (sched->ssd_cache->is_packed(input)) {
@@ -2751,7 +3002,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     moe_trace.emit("consumer_end", node->src[0]->name, -1, 0, 0, ggml_backend_name(split_backend));
                 }
             }
-        } else if (!sched->callback_eval && !(sched->ssd_cache && sched->ssd_cache->prefetch_mode_is_b())) {
+        } else if (!sched->callback_eval && !(sched->ssd_cache && sched->ssd_cache->needs_prediction_callback())) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;

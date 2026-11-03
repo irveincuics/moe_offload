@@ -64,6 +64,7 @@ static void quiet_log(enum ggml_log_level level, const char * text, void *) {
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR ||
             std::string(text).find("ssd_moe_cache: final_evals=") == 0 ||
             std::string(text).find("moe_prefetch:") == 0 ||
+            std::string(text).find("moe_prefetch_cpu:") == 0 ||
             std::string(text).find("moe_prefetch_prefill:") == 0) { fputs(text, stderr); }
 }
 
@@ -110,26 +111,33 @@ static int run(const json & config) {
     env_flag("GGML_MOE_MMAP_ONLY", baseline == "mmap");
     env_flag("GGML_MOE_VERIFY_WEIGHTS", verify);
     env_flag("GGML_MOE_FORCE_GPU", config.value("gpu_experts", true));
+    if (config.contains("zero_copy")) { env_flag("GGML_MOE_ZERO_COPY", config.at("zero_copy").get<bool>()); }
     if (config.contains("pack")) { setenv("LLAMA_SSD_MOE_PACK", config.at("pack").get<std::string>().c_str(), 1); }
     const std::string ssd_pack = getenv("LLAMA_SSD_MOE_PACK") ? getenv("LLAMA_SSD_MOE_PACK") : "";
     const std::string prefetch = config.value("prefetch", "none");
     const std::string history_bank = config.value("history_bank", "");
     const std::string distance = std::to_string(config.value("prefetch_distance", 4));
-    const std::string count = std::to_string(config.value("prefetch_count", 4));
-    const std::string prefill_count = std::to_string(config.value("prefill_prefetch_count", 16));
-    const std::string prefill_slots = std::to_string(config.value("prefill_prefetch_slots", 64));
+    const std::string count = std::to_string(config.value("prefetch_count", prefetch == "cpu" ? 2 : (prefetch == "cpu_history" ? 0 : 4)));
+    const std::string prefill_count = std::to_string(config.value("prefill_prefetch_count", prefetch == "cpu_history" ? 8 : 16));
+    const std::string prefill_slots = std::to_string(config.value("prefill_prefetch_slots", prefetch == "cpu_history" ? 32 : 64));
+    const std::string cpu_decode_slots = std::to_string(config.value("cpu_decode_prefetch_slots", 4));
+    const std::string cpu_decode_temporal_weight = std::to_string(config.value("cpu_decode_temporal_weight", 1.0));
     setenv("GGML_MOE_PREFETCH", prefetch.c_str(), 1);
     setenv("GGML_MOE_HISTORY_BANK", history_bank.c_str(), 1);
     setenv("GGML_MOE_PREFETCH_DISTANCE", distance.c_str(), 1);
     setenv("GGML_MOE_PREFETCH_COUNT", count.c_str(), 1);
     setenv("GGML_MOE_PREFILL_PREFETCH_COUNT", prefill_count.c_str(), 1);
     setenv("GGML_MOE_PREFILL_PREFETCH_SLOTS", prefill_slots.c_str(), 1);
+    setenv("GGML_MOE_CPU_DECODE_PREFETCH_SLOTS", cpu_decode_slots.c_str(), 1);
+    setenv("GGML_MOE_CPU_DECODE_TEMPORAL_WEIGHT", cpu_decode_temporal_weight.c_str(), 1);
+    env_flag("GGML_MOE_CPU_ASYNC", config.value("cpu_async", true));
     setenv("GGML_MOE_B_ADAPTER", config.value("b_adapter", "").c_str(), 1);
-    setenv("GGML_MOE_B_MARGIN", std::to_string(config.value("b_margin", 0.0)).c_str(), 1);
+    setenv("GGML_MOE_B_MARGIN", std::to_string(config.value("b_margin", prefetch == "cpu" ? 0.25 : 0.0)).c_str(), 1);
 
-    if (prefetch != "none" && prefetch[0] != 'b' && (baseline != "async" || history_bank.empty())) {
+    if (prefetch != "none" && prefetch[0] != 'b' && prefetch != "cpu" && prefetch != "cpu_history" && (baseline != "async" || history_bank.empty())) {
         throw std::runtime_error("history prefetch requires async and a history bank");
     }
+    if ((prefetch == "cpu" || prefetch == "cpu_history") && baseline != "async") { throw std::runtime_error("CPU prefetch requires async SSD demand"); }
 
     if (!diagnostic) {
         llama_log_set(quiet_log, nullptr);
@@ -143,7 +151,7 @@ static int run(const json & config) {
     mp.split_mode = LLAMA_SPLIT_MODE_NONE;
     mp.ssd_moe_offload = baseline != "resident";
     const size_t cache_mib = config.value("cache_mib", size_t(8192));
-    const size_t reserve_mib = config.value("history_reserve_mib", size_t(0));
+    const size_t reserve_mib = config.value("history_reserve_mib", size_t(prefetch == "cpu" ? 64 : 0));
     if (reserve_mib >= cache_mib) { throw std::runtime_error("history reserve exceeds cache budget"); }
     mp.ssd_moe_cache_size = (cache_mib - reserve_mib) * 1024 * 1024;
     mp.ssd_moe_cache_workers = config.value("workers", 4u);
@@ -268,6 +276,10 @@ static int run(const json & config) {
         json summary = {{"id", id}, {"baseline", baseline}, {"action", action}, {"diagnostic", diagnostic},
             {"prefetch", prefetch}, {"prefetch_distance", std::stoi(distance)}, {"prefetch_count", std::stoi(count)},
             {"prefill_prefetch_count", std::stoi(prefill_count)}, {"prefill_prefetch_slots", std::stoi(prefill_slots)},
+            {"cpu_decode_prefetch_slots", std::stoi(cpu_decode_slots)},
+            {"cpu_decode_temporal_weight", std::stod(cpu_decode_temporal_weight)},
+            {"cpu_async", config.value("cpu_async", true)},
+            {"zero_copy", getenv("GGML_MOE_ZERO_COPY") && atoi(getenv("GGML_MOE_ZERO_COPY")) == 1},
             {"history_reserve_mib", reserve_mib}, {"expert_cache_mib", cache_mib - reserve_mib},
             {"ssd_pack", ssd_pack},
             {"verify_weights", verify}, {"prompt_tokens", prompt.size()}, {"generated_tokens", generated.size()},
